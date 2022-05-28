@@ -166,7 +166,13 @@ fn main() -> anyhow::Result<()> {
                 let mut buffer = [0; READ_BUFFER_SIZE];
                 while let Ok(entry) = entries_rx.recv() {
                     let path = entry.path();
-                    let file = File::open(path)?;
+                    let file = match File::open(path) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            log::warn!("Error while opening {:?}: {}", path, e);
+                            continue;
+                        }
+                    };
                     let file_size = entry.metadata()?.len();
                     if file_size == 0 {
                         // Don't bother for empty files
