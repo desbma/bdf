@@ -128,6 +128,12 @@ fn same_extents(first: &Path, second: &Path) -> Result<bool, io::Error> {
     Ok(true)
 }
 
+/// Return true if path is on a Btrfs filesystem
+fn is_on_btrfs(path: &Path) -> nix::Result<bool> {
+    let statfs = nix::sys::statfs::statfs(path)?;
+    Ok(statfs.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC)
+}
+
 fn main() -> anyhow::Result<()> {
     // Init logger
     simple_logger::SimpleLogger::new()
@@ -137,6 +143,11 @@ fn main() -> anyhow::Result<()> {
     // Parse command line opts
     let cl_opts = CommandLineOpts::from_args();
     log::trace!("{:?}", cl_opts);
+    anyhow::ensure!(
+        is_on_btrfs(&cl_opts.dir)?,
+        "Input directory {:?} is not on a Btrfs filesystem",
+        cl_opts.dir
+    );
 
     // Get usable core count
     let cpu_count = num_cpus::get();
