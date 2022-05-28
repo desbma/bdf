@@ -15,7 +15,7 @@ Compared to alternative solutions, `bdf` is fast and simple. It does not store a
 
 1. For all files, get the file size and compute the [XXH3-64](https://github.com/Cyan4973/xxHash)
 2. For files with similar hashes and size, check the file content (for the extremely unlikely but possible case of a hash collision)
-3. For files with similar content, check if some Btrfs file extents are different.
+3. For files with similar content, check if some Btrfs file extents are different (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html))
 4. If some extents are not shared, the files are considered duplicates candidate for reflinking
 
 ## Installation
