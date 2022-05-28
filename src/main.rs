@@ -194,7 +194,13 @@ fn main() -> anyhow::Result<()> {
             .same_file_system(true)
             .into_iter()
         {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    log::warn!("{}", e);
+                    continue;
+                }
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
