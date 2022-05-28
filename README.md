@@ -3,11 +3,11 @@
 [![Build status](https://github.com/desbma/bdf/actions/workflows/ci.yml/badge.svg)](https://github.com/desbma/bdf/actions)
 [![License](https://img.shields.io/github/license/desbma/bdf.svg?style=flat)](https://github.com/desbma/bdf/blob/master/LICENSE)
 
-`bdf` (Btrfs Duplicate Finder)
+Btrfs Duplicate Finder
 
 `bdf` is a simple tool to efficiently find identical files, candidates for [reflinking](https://btrfs.readthedocs.io/en/latest/Reflink.html), on Btrfs filesystems.
 
-In keeping with Unix philosophy, it does only one thing: find duplicates not yet reflinked. It does not deduplicate files, it is up to you to decide what to do with the identical files. It is very easy to use `bdf`'s output to deduplicate tghough, see [Auto deduplication](### Auto deduplication).
+In keeping with Unix philosophy, it does only one thing: find duplicates not yet reflinked. It does not deduplicate files, it is up to you to decide what to do with the identical files. It is very easy to use `bdf`'s output to deduplicate tghough, see [Auto deduplication](###auto-deduplication).
 
 Compared to alternative solutions, `bdf` is fast and simple. It does not store any state or database locally, and does not touch your files, you can even run it on a read only mounted filesystem.
 
@@ -38,7 +38,7 @@ See `bdf -h` for complete command line reference.
 
 ### Auto deduplication
 
-To automatically deduplicate files, run `bdf` with `xargs`, and deduplicate with `cp`:
+To automatically deduplicate files in directory `target_dir`, run `bdf` with `xargs`, and deduplicate with `cp`:
 
 ```
 bdf target_dir | xargs -0 -n 2 cp -v --reflink=always --preserve=all
