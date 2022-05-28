@@ -25,6 +25,10 @@ type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Rec
 pub struct CommandLineOpts {
     /// Input directory tree
     pub dir: PathBuf,
+
+    /// Minimum file size in bytes to consider
+    #[structopt(short, long)]
+    pub min_size: Option<u64>,
 }
 
 /// Compute XXH3-64 non cryptographic hash
@@ -177,6 +181,11 @@ fn main() -> anyhow::Result<()> {
                     if file_size == 0 {
                         // Don't bother for empty files
                         continue;
+                    }
+                    if let Some(min_size) = cl_opts.min_size {
+                        if file_size < min_size {
+                            continue;
+                        }
                     }
                     let mut reader = BufReader::new(file);
 
