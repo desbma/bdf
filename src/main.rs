@@ -1,9 +1,11 @@
 //! Btrfs Duplicate Finder
 
 use std::cmp::max;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -23,8 +25,8 @@ type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Rec
 #[derive(Debug, StructOpt)]
 #[structopt(version=env!("CARGO_PKG_VERSION"), about="Find identical files, candidates for reflinking, on Btrfs filesystems.")]
 pub struct CommandLineOpts {
-    /// Input directory tree
-    pub dir: PathBuf,
+    /// Input directory tree, if not set will take NUL terminated paths from stdin
+    pub dir: Option<PathBuf>,
 
     /// Minimum file size in bytes to consider
     #[structopt(short, long)]
@@ -143,11 +145,13 @@ fn main() -> anyhow::Result<()> {
     // Parse command line opts
     let cl_opts = CommandLineOpts::from_args();
     log::trace!("{:?}", cl_opts);
-    anyhow::ensure!(
-        is_on_btrfs(&cl_opts.dir)?,
-        "Input directory {:?} is not on a Btrfs filesystem",
-        cl_opts.dir
-    );
+    if let Some(input_dir) = cl_opts.dir.as_ref() {
+        anyhow::ensure!(
+            is_on_btrfs(input_dir)?,
+            "Input directory {:?} is not on a Btrfs filesystem",
+            input_dir
+        );
+    }
 
     // Get usable core count
     let cpu_count = num_cpus::get();
@@ -216,25 +220,67 @@ fn main() -> anyhow::Result<()> {
         drop(hash_tx);
 
         // Iterate over files
-        for entry in walkdir::WalkDir::new(cl_opts.dir)
-            .same_file_system(true)
-            .into_iter()
-        {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    log::warn!("{}", e);
+        if let Some(input_dir) = cl_opts.dir {
+            for entry in walkdir::WalkDir::new(input_dir)
+                .same_file_system(true)
+                .into_iter()
+            {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        log::warn!("{}", e);
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file() {
                     continue;
                 }
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            log::debug!("{:?}", entry.path());
-            progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
-            progress.set_message(format!("{}", progress_counters));
+                log::debug!("{:?}", entry.path());
+                progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
+                progress.set_message(format!("{}", progress_counters));
 
-            entries_tx.send(entry)?;
+                entries_tx.send(entry)?;
+            }
+        } else {
+            let mut stdin_locked = io::stdin().lock();
+            let mut buf = Vec::new();
+            let mut first = false;
+            loop {
+                buf.clear();
+                if stdin_locked.read_until(0, &mut buf)? == 0 {
+                    break;
+                }
+                buf.truncate(buf.len() - 1);
+                let path = Path::new(OsStr::from_bytes(&buf));
+                let entry = match walkdir::WalkDir::new(path)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Woot"))?
+                {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        log::warn!("{}", e);
+                        continue;
+                    }
+                };
+                if !entry.file_type().is_file() {
+                    log::warn!("{:?} is not a file, ignoring it", path);
+                    continue;
+                }
+                if !first {
+                    anyhow::ensure!(
+                        is_on_btrfs(path)?,
+                        "Input file {:?} is not on a Btrfs filesystem",
+                        path
+                    );
+                    first = false;
+                }
+                log::debug!("{:?}", path);
+                progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
+                progress.set_message(format!("{}", progress_counters));
+
+                entries_tx.send(entry)?;
+            }
         }
         drop(entries_tx);
 
