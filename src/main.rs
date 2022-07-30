@@ -1,6 +1,7 @@
 //! Btrfs Duplicate Finder
 
 use std::cmp::max;
+use std::collections::hash_map::{Entry, HashMap};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
@@ -157,9 +158,10 @@ fn main() -> anyhow::Result<()> {
     let cpu_count = num_cpus::get();
 
     // Channels
-    let (entries_tx, entries_rx): CrossbeamChannel<walkdir::DirEntry> =
+    let (to_hashed_tx, to_hashed_rx): CrossbeamChannel<(PathBuf, u64)> =
         crossbeam_channel::unbounded();
-    let (hash_tx, hash_rx): CrossbeamChannel<(PathBuf, u64, u64)> = crossbeam_channel::unbounded();
+    let (hashed_tx, hashed_rx): CrossbeamChannel<(PathBuf, u64, u64)> =
+        crossbeam_channel::unbounded();
 
     // File hash map
     let mut files: MultiMap<(u64, u64), PathBuf> = MultiMap::new();
@@ -175,51 +177,41 @@ fn main() -> anyhow::Result<()> {
         // Worker threads
         for _ in 0..max(cpu_count - 1, 1) {
             // Per thread clones
-            let entries_rx = entries_rx.clone();
-            let hash_tx = hash_tx.clone();
+            let to_hashed_rx = to_hashed_rx.clone();
+            let hashed_tx = hashed_tx.clone();
             let progress = progress.clone();
             let progress_counters = Arc::clone(&progress_counters);
 
             scope.spawn(move |_| -> anyhow::Result<()> {
                 let mut hasher = xxh3::Xxh3::new();
                 let mut buffer = [0; READ_BUFFER_SIZE];
-                while let Ok(entry) = entries_rx.recv() {
-                    let path = entry.path();
-                    let file = match File::open(path) {
+                while let Ok((path, file_size)) = to_hashed_rx.recv() {
+                    let file = match File::open(&path) {
                         Ok(file) => file,
                         Err(e) => {
                             log::warn!("Error while opening {:?}: {}", path, e);
                             continue;
                         }
                     };
-                    let file_size = entry.metadata()?.len();
-                    if file_size == 0 {
-                        // Don't bother for empty files
-                        continue;
-                    }
-                    if let Some(min_size) = cl_opts.min_size {
-                        if file_size < min_size {
-                            continue;
-                        }
-                    }
-                    let mut reader = BufReader::new(file);
 
+                    let mut reader = BufReader::new(file);
                     let hash = compute_xxh(&mut hasher, &mut reader, &mut buffer)?;
 
                     log::debug!("{:?} {:016x}", path, hash);
                     progress_counters.hash_count.fetch_add(1, Ordering::AcqRel);
                     progress.set_message(format!("{}", progress_counters));
 
-                    hash_tx.send((path.to_path_buf(), file_size, hash))?;
+                    hashed_tx.send((path, file_size, hash))?;
                 }
 
                 Ok(())
             });
         }
-        drop(entries_rx);
-        drop(hash_tx);
+        drop(to_hashed_rx);
+        drop(hashed_tx);
 
         // Iterate over files
+        let mut entry_map: HashMap<u64, Option<walkdir::DirEntry>> = HashMap::new();
         if let Some(input_dir) = cl_opts.dir {
             for entry in walkdir::WalkDir::new(input_dir)
                 .same_file_system(true)
@@ -235,11 +227,44 @@ fn main() -> anyhow::Result<()> {
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                log::debug!("{:?}", entry.path());
+                let file_size = entry.metadata()?.len();
+                if file_size == 0 {
+                    // Don't bother for empty files
+                    continue;
+                }
+                if let Some(min_size) = cl_opts.min_size {
+                    if file_size < min_size {
+                        continue;
+                    }
+                }
+                let path = entry.path();
+                log::debug!("{:?}", path);
                 progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{}", progress_counters));
 
-                entries_tx.send(entry)?;
+                // Decide what to to depending on whether or not we have already seen some files for this size
+                // This allows saving some hash computations for the common case
+                match entry_map.entry(file_size) {
+                    Entry::Vacant(e) => {
+                        // First file for this size, keep entry and move along
+                        e.insert(Some(entry));
+                    }
+                    Entry::Occupied(e) => {
+                        match e.get() {
+                            Some(_) => {
+                                // Second file for this size, send this one and the previous to the channel, and set map
+                                // so the next ones will be sent immediately
+                                let prev_entry = e.into_mut().take().unwrap();
+                                to_hashed_tx.send((prev_entry.path().to_path_buf(), file_size))?;
+                                to_hashed_tx.send((path.to_path_buf(), file_size))?;
+                            }
+                            None => {
+                                // Not the first file not second for this size, send it to channel immediately
+                                to_hashed_tx.send((path.to_path_buf(), file_size))?;
+                            }
+                        }
+                    }
+                }
             }
         } else {
             let mut stdin_locked = io::stdin().lock();
@@ -275,17 +300,27 @@ fn main() -> anyhow::Result<()> {
                     );
                     first = false;
                 }
+                let file_size = entry.metadata()?.len();
+                if file_size == 0 {
+                    // Don't bother for empty files
+                    continue;
+                }
+                if let Some(min_size) = cl_opts.min_size {
+                    if file_size < min_size {
+                        continue;
+                    }
+                }
                 log::debug!("{:?}", path);
                 progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{}", progress_counters));
 
-                entries_tx.send(entry)?;
+                to_hashed_tx.send((path.to_path_buf(), file_size))?;
             }
         }
-        drop(entries_tx);
+        drop(to_hashed_tx);
 
         // Fill hashmap
-        for (filepath, file_size, hash) in hash_rx.iter() {
+        for (filepath, file_size, hash) in hashed_rx.iter() {
             files.insert((file_size, hash), filepath);
         }
         Ok(())
