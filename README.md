@@ -1,6 +1,7 @@
 # bdf
 
 [![Build status](https://github.com/desbma/bdf/actions/workflows/ci.yml/badge.svg)](https://github.com/desbma/bdf/actions)
+[![AUR version](https://img.shields.io/aur/version/bdf.svg?style=flat)](https://aur.archlinux.org/packages/bdf/)
 [![License](https://img.shields.io/github/license/desbma/bdf.svg?style=flat)](https://github.com/desbma/bdf/blob/master/LICENSE)
 
 Btrfs Duplicate Finder
@@ -31,6 +32,10 @@ cargo build --release
 strip --strip-all target/release/bdf
 install -Dm 755 -t /usr/local/bin target/release/bdf
 ```
+
+### From the AUR
+
+Arch Linux users can install the [bdf AUR package](https://aur.archlinux.org/packages/bdf/).
 
 ## Usage
 
