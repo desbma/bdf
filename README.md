@@ -19,7 +19,7 @@ Compared to alternative solutions, `bdf` is fast and simple. It does not store a
 3. For files with similar content, check if some Btrfs file extents are different (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html))
 4. If some extents are not shared, the files are considered duplicates candidate for reflinking
 
-_\* Some optimizations take place: we only compute hashes for files having the same size as at least another file. This avoids computing hashes for files which can not be duplicate anyway (the common case), and leads to a major overall speedup._
+_\* Some optimizations take place: we only compute hashes for files having the same size as at least another file. This avoids computing hashes for files which can not be duplicate anyway (the common case), and leads to a major overall speedup. Hashes are also computed in separate threads to make use of multi core CPUs._
 
 ## Installation
 
