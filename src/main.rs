@@ -199,7 +199,7 @@ fn main() -> anyhow::Result<()> {
 
                     log::debug!("{:?} {:016x}", path, hash);
                     progress_counters.hash_count.fetch_add(1, Ordering::AcqRel);
-                    progress.set_message(format!("{}", progress_counters));
+                    progress.set_message(format!("{progress_counters}"));
 
                     hashed_tx.send((path, file_size, hash))?;
                 }
@@ -240,7 +240,7 @@ fn main() -> anyhow::Result<()> {
                 let path = entry.path();
                 log::debug!("{:?}", path);
                 progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{}", progress_counters));
+                progress.set_message(format!("{progress_counters}"));
 
                 // Decide what to to depending on whether or not we have already seen some files for this size
                 // This allows saving some hash computations for the common case
@@ -312,7 +312,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 log::debug!("{:?}", path);
                 progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{}", progress_counters));
+                progress.set_message(format!("{progress_counters}"));
 
                 to_hashed_tx.send((path.to_path_buf(), file_size))?;
             }
@@ -350,7 +350,7 @@ fn main() -> anyhow::Result<()> {
                 progress_counters
                     .hash_collision_count
                     .fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{}", progress_counters));
+                progress.set_message(format!("{progress_counters}"));
                 continue;
             }
 
@@ -359,7 +359,7 @@ fn main() -> anyhow::Result<()> {
                 progress_counters
                     .reflinked_count
                     .fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{}", progress_counters));
+                progress.set_message(format!("{progress_counters}"));
                 continue;
             }
 
@@ -371,7 +371,7 @@ fn main() -> anyhow::Result<()> {
             progress_counters
                 .duplicate_candidate_count
                 .fetch_add(1, Ordering::AcqRel);
-            progress.set_message(format!("{}", progress_counters));
+            progress.set_message(format!("{progress_counters}"));
             print!("{}\0{}\0", first.to_str().unwrap(), other.to_str().unwrap());
         }
     }
