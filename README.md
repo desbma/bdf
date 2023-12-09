@@ -47,7 +47,7 @@ See `bdf -h` for complete command line reference.
 To automatically deduplicate files in directory `target_dir`, run `bdf` with `xargs`, and deduplicate with `cp`:
 
 ```
-bdf target_dir | xargs -0 -r -p -n 2 cp -v --reflink=always --preserve=all
+bdf target_dir | xargs -0 -r -p -n 2 cp -v --reflink=always
 ```
 
 You will need to confirm before each deduplication (due to `xargs` `-p` switch). Be careful because if a file is modified during the analysis, it may get deduplicated although the pair of files are not identical anymore.
