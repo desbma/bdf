@@ -9,16 +9,15 @@ codegen-units = 1
 strip = true
 
 [dependencies]
-anyhow = { version = "1.0", features = ["backtrace"] }
-crossbeam-channel = "0.5"
-crossbeam-utils = "0.8"
-fiemap = "0.1"
-indicatif = "0.16"
-log = { version = "0.4", features = ["max_level_trace", "release_max_level_info"] }
-multimap = "0.8"
-nix = { version = "0.24", default-features = false, features = ["fs"] }
-num_cpus = "1.13"
-simple_logger = { version = "2.1", default-features = false, features = ["stderr"] }
-structopt = "0.3"
-walkdir = "2.3"
-xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
+anyhow = { version = "1.0.75", default-features = false, features = ["std", "backtrace"] }
+clap = { version = "4.4.11", default-features = false, features = ["std", "color", "help", "usage", "error-context", "suggestions", "derive"] }
+crossbeam-channel = { version = "0.5.8", default-features = false, features = ["std"] }
+crossbeam-utils = { version = "0.8.16", default-features = false, features = ["std"] }
+fiemap = { version = "0.1.1", default-features = false }
+indicatif = { version = "0.17.7", default-features = false }
+log = { version = "0.4.20", features = ["max_level_trace", "release_max_level_info"] }
+multimap = { version = "0.9.1", default-features = false }
+nix = { version = "0.27.1", default-features = false, features = ["fs"] }
+simple_logger = { version = "4.3.0", default-features = false, features = ["colors", "stderr"] }
+walkdir = { version = "2.4.0", default-features = false }
+xxhash-rust = { version = "0.8.7", default-features = false, features = ["xxh3"] }

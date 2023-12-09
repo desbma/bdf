@@ -1,19 +1,25 @@
 //! Btrfs Duplicate Finder
 
-use std::cmp::max;
-use std::collections::hash_map::{Entry, HashMap};
-use std::ffi::OsStr;
-use std::fmt;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::{
+    cmp::max,
+    collections::hash_map::{Entry, HashMap},
+    ffi::OsStr,
+    fmt,
+    fs::File,
+    io::{self, BufRead, BufReader, Read},
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::Context;
+use clap::Parser;
 use multimap::MultiMap;
-use structopt::StructOpt;
 use xxhash_rust::xxh3;
 
 /// File read chunk size, in bytes
@@ -23,8 +29,11 @@ const READ_BUFFER_SIZE: usize = 256 * 1024;
 type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>);
 
 /// Command line arguments
-#[derive(Debug, StructOpt)]
-#[structopt(version=env!("CARGO_PKG_VERSION"), about="Find identical files, candidates for reflinking, on Btrfs filesystems.")]
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Find identical files, candidates for reflinking, on Btrfs filesystems."
+)]
 pub struct CommandLineOpts {
     /// Input directory tree, if not set will take NUL terminated paths from stdin
     pub dir: Option<PathBuf>,
@@ -144,7 +153,7 @@ fn main() -> anyhow::Result<()> {
         .context("Failed to init logger")?;
 
     // Parse command line opts
-    let cl_opts = CommandLineOpts::from_args();
+    let cl_opts = CommandLineOpts::parse();
     log::trace!("{:?}", cl_opts);
     if let Some(input_dir) = cl_opts.dir.as_ref() {
         anyhow::ensure!(
@@ -155,7 +164,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Get usable core count
-    let cpu_count = num_cpus::get();
+    let cpu_count = thread::available_parallelism()?.get();
 
     // Channels
     let (to_hashed_tx, to_hashed_rx): CrossbeamChannel<(PathBuf, u64)> =
@@ -168,9 +177,7 @@ fn main() -> anyhow::Result<()> {
 
     // Progress
     let progress = indicatif::ProgressBar::new_spinner();
-    progress.set_draw_delta(1);
-    //progress.set_draw_rate(1);
-    progress.enable_steady_tick(300);
+    progress.enable_steady_tick(Duration::from_millis(300));
     let progress_counters = Arc::new(ProgressCounters::new());
 
     crossbeam_utils::thread::scope(|scope| -> anyhow::Result<()> {
