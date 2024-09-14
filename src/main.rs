@@ -63,26 +63,26 @@ fn compute_xxh(
 /// Processing progress counters
 struct ProgressCounters {
     /// Number of files that were targeted for analysis
-    file_count: AtomicUsize,
+    file: AtomicUsize,
     /// Number of files that were hashed
-    hash_count: AtomicUsize,
+    hash: AtomicUsize,
     /// Number of hash collisions
-    hash_collision_count: AtomicUsize,
+    hash_collision: AtomicUsize,
     /// Number of identical files already reflinked
-    reflinked_count: AtomicUsize,
+    reflinked: AtomicUsize,
     /// Number of duplicate files, candidates for reflinking
-    duplicate_candidate_count: AtomicUsize,
+    duplicate_candidate: AtomicUsize,
 }
 
 impl ProgressCounters {
     /// Constructor
     fn new() -> Self {
         Self {
-            file_count: AtomicUsize::new(0),
-            hash_count: AtomicUsize::new(0),
-            hash_collision_count: AtomicUsize::new(0),
-            reflinked_count: AtomicUsize::new(0),
-            duplicate_candidate_count: AtomicUsize::new(0),
+            file: AtomicUsize::new(0),
+            hash: AtomicUsize::new(0),
+            hash_collision: AtomicUsize::new(0),
+            reflinked: AtomicUsize::new(0),
+            duplicate_candidate: AtomicUsize::new(0),
         }
     }
 }
@@ -92,11 +92,11 @@ impl fmt::Display for ProgressCounters {
         write!(
             f,
             "{} files, {} hashes, {} hash collisions, {} already reflinked, {} duplicates",
-            self.file_count.load(Ordering::Relaxed),
-            self.hash_count.load(Ordering::Relaxed),
-            self.hash_collision_count.load(Ordering::Relaxed),
-            self.reflinked_count.load(Ordering::Relaxed),
-            self.duplicate_candidate_count.load(Ordering::Relaxed),
+            self.file.load(Ordering::Relaxed),
+            self.hash.load(Ordering::Relaxed),
+            self.hash_collision.load(Ordering::Relaxed),
+            self.reflinked.load(Ordering::Relaxed),
+            self.duplicate_candidate.load(Ordering::Relaxed),
         )
     }
 }
@@ -146,6 +146,7 @@ fn is_on_btrfs(path: &Path) -> nix::Result<bool> {
     Ok(statfs.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC)
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     // Init logger
     simple_logger::SimpleLogger::new()
@@ -205,7 +206,7 @@ fn main() -> anyhow::Result<()> {
                     let hash = compute_xxh(&mut hasher, &mut reader, &mut buffer)?;
 
                     log::debug!("{:?} {:016x}", path, hash);
-                    progress_counters.hash_count.fetch_add(1, Ordering::AcqRel);
+                    progress_counters.hash.fetch_add(1, Ordering::AcqRel);
                     progress.set_message(format!("{progress_counters}"));
 
                     hashed_tx.send((path, file_size, hash))?;
@@ -220,10 +221,7 @@ fn main() -> anyhow::Result<()> {
         // Iterate over files
         let mut entry_map: HashMap<u64, Option<walkdir::DirEntry>> = HashMap::new();
         if let Some(input_dir) = cl_opts.dir {
-            for entry in walkdir::WalkDir::new(input_dir)
-                .same_file_system(true)
-                .into_iter()
-            {
+            for entry in walkdir::WalkDir::new(input_dir).same_file_system(true) {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
@@ -246,7 +244,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let path = entry.path();
                 log::debug!("{:?}", path);
-                progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
+                progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
 
                 // Decide what to to depending on whether or not we have already seen some files for this size
@@ -318,7 +316,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 log::debug!("{:?}", path);
-                progress_counters.file_count.fetch_add(1, Ordering::AcqRel);
+                progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
 
                 to_hashed_tx.send((path.to_path_buf(), file_size))?;
@@ -327,7 +325,7 @@ fn main() -> anyhow::Result<()> {
         drop(to_hashed_tx);
 
         // Fill hashmap
-        for (filepath, file_size, hash) in hashed_rx.iter() {
+        for (filepath, file_size, hash) in &hashed_rx {
             files.insert((file_size, hash), filepath);
         }
         Ok(())
@@ -338,7 +336,7 @@ fn main() -> anyhow::Result<()> {
     for key in files
         .keys()
         .filter(|k| !files.is_vec(k))
-        .map(|k| k.to_owned())
+        .map(ToOwned::to_owned)
         .collect::<Vec<_>>()
     {
         files.remove(&key);
@@ -355,7 +353,7 @@ fn main() -> anyhow::Result<()> {
                     other
                 );
                 progress_counters
-                    .hash_collision_count
+                    .hash_collision
                     .fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
                 continue;
@@ -363,9 +361,7 @@ fn main() -> anyhow::Result<()> {
 
             if same_extents(first, other)? {
                 log::debug!("Files {:?} and {:?} are already reflinked", first, other);
-                progress_counters
-                    .reflinked_count
-                    .fetch_add(1, Ordering::AcqRel);
+                progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
                 continue;
             }
@@ -376,7 +372,7 @@ fn main() -> anyhow::Result<()> {
                 other.to_str().unwrap()
             );
             progress_counters
-                .duplicate_candidate_count
+                .duplicate_candidate
                 .fetch_add(1, Ordering::AcqRel);
             progress.set_message(format!("{progress_counters}"));
             print!("{}\0{}\0", first.to_str().unwrap(), other.to_str().unwrap());
