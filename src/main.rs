@@ -155,12 +155,11 @@ fn main() -> anyhow::Result<()> {
 
     // Parse command line opts
     let cl_opts = CommandLineOpts::parse();
-    log::trace!("{:?}", cl_opts);
+    log::trace!("{cl_opts:?}");
     if let Some(input_dir) = cl_opts.dir.as_ref() {
         anyhow::ensure!(
             is_on_btrfs(input_dir)?,
-            "Input directory {:?} is not on a Btrfs filesystem",
-            input_dir
+            "Input directory {input_dir:?} is not on a Btrfs filesystem"
         );
     }
 
@@ -197,7 +196,7 @@ fn main() -> anyhow::Result<()> {
                     let file = match File::open(&path) {
                         Ok(file) => file,
                         Err(e) => {
-                            log::warn!("Error while opening {:?}: {}", path, e);
+                            log::warn!("Error while opening {path:?}: {e}");
                             continue;
                         }
                     };
@@ -205,7 +204,7 @@ fn main() -> anyhow::Result<()> {
                     let mut reader = BufReader::new(file);
                     let hash = compute_xxh(&mut hasher, &mut reader, &mut buffer)?;
 
-                    log::debug!("{:?} {:016x}", path, hash);
+                    log::debug!("{path:?} {hash:016x}");
                     progress_counters.hash.fetch_add(1, Ordering::AcqRel);
                     progress.set_message(format!("{progress_counters}"));
 
@@ -225,7 +224,7 @@ fn main() -> anyhow::Result<()> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
-                        log::warn!("{}", e);
+                        log::warn!("{e}");
                         continue;
                     }
                 };
@@ -243,7 +242,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 let path = entry.path();
-                log::debug!("{:?}", path);
+                log::debug!("{path:?}");
                 progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
 
@@ -289,19 +288,18 @@ fn main() -> anyhow::Result<()> {
                 {
                     Ok(entry) => entry,
                     Err(e) => {
-                        log::warn!("{}", e);
+                        log::warn!("{e}");
                         continue;
                     }
                 };
                 if !entry.file_type().is_file() {
-                    log::warn!("{:?} is not a file, ignoring it", path);
+                    log::warn!("{path:?} is not a file, ignoring it");
                     continue;
                 }
                 if !first {
                     anyhow::ensure!(
                         is_on_btrfs(path)?,
-                        "Input file {:?} is not on a Btrfs filesystem",
-                        path
+                        "Input file {path:?} is not on a Btrfs filesystem"
                     );
                     first = false;
                 }
@@ -315,7 +313,7 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 }
-                log::debug!("{:?}", path);
+                log::debug!("{path:?}");
                 progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
 
@@ -330,7 +328,7 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(())
     })
-    .map_err(|e| anyhow::anyhow!("Worker thread error: {:?}", e))??;
+    .map_err(|e| anyhow::anyhow!("Worker thread error: {e:?}"))??;
 
     // Remove unique hashes
     for key in files
@@ -348,9 +346,7 @@ fn main() -> anyhow::Result<()> {
         for other in filepaths.iter().skip(1) {
             if !same_content(first, other)? {
                 log::warn!(
-                    "Files {:?} and {:?} have the same size and hash but not the same content",
-                    first,
-                    other
+                    "Files {first:?} and {other:?} have the same size and hash but not the same content"
                 );
                 progress_counters
                     .hash_collision
@@ -360,7 +356,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             if same_extents(first, other)? {
-                log::debug!("Files {:?} and {:?} are already reflinked", first, other);
+                log::debug!("Files {first:?} and {other:?} are already reflinked");
                 progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
                 continue;
