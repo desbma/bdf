@@ -6,8 +6,8 @@ use std::{
     ffi::OsStr,
     fmt,
     fs::File,
-    io::{self, BufRead, BufReader, Read},
-    os::unix::ffi::OsStrExt,
+    io::{self, BufRead as _, BufReader, Read as _},
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::Context as _;
 use clap::Parser;
 use multimap::MultiMap;
 use xxhash_rust::xxh3;
@@ -107,8 +107,8 @@ fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
     let file2 = File::open(second)?;
     let mut reader1 = BufReader::new(file1);
     let mut reader2 = BufReader::new(file2);
-    let mut buffer1 = [0; READ_BUFFER_SIZE];
-    let mut buffer2 = [0; READ_BUFFER_SIZE];
+    let mut buffer1 = vec![0; READ_BUFFER_SIZE];
+    let mut buffer2 = vec![0; READ_BUFFER_SIZE];
     loop {
         let rd_count = reader1.read(&mut buffer1)?;
         if rd_count == 0 {
@@ -146,7 +146,7 @@ fn is_on_btrfs(path: &Path) -> nix::Result<bool> {
     Ok(statfs.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC)
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     // Init logger
     simple_logger::SimpleLogger::new()
@@ -191,7 +191,7 @@ fn main() -> anyhow::Result<()> {
 
             scope.spawn(move |_| -> anyhow::Result<()> {
                 let mut hasher = xxh3::Xxh3::new();
-                let mut buffer = [0; READ_BUFFER_SIZE];
+                let mut buffer = vec![0; READ_BUFFER_SIZE];
                 while let Ok((path, file_size)) = to_hashed_rx.recv() {
                     let file = match File::open(&path) {
                         Ok(file) => file,
