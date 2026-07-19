@@ -43,12 +43,9 @@ pub struct CommandLineOpts {
     pub min_size: Option<u64>,
 }
 
-/// Compute XXH3-64 non cryptographic hash
-fn compute_xxh(
-    hasher: &mut xxh3::Xxh3,
-    reader: &mut BufReader<File>,
-    buffer: &mut [u8],
-) -> Result<u64, io::Error> {
+/// Compute an XXH3-64 non-cryptographic file hash
+fn hash_file(path: &Path, hasher: &mut xxh3::Xxh3, buffer: &mut [u8]) -> Result<u64, io::Error> {
+    let mut reader = BufReader::new(File::open(path)?);
     hasher.reset();
     loop {
         let rd_count = reader.read(buffer)?;
@@ -167,6 +164,23 @@ where
     writer.write_all(b"\0")
 }
 
+/// Return the size when the entry should be hashed
+fn wanted_file_size(entry: &walkdir::DirEntry, min_size: Option<u64>) -> Option<u64> {
+    let file_size = entry
+        .metadata()
+        .inspect_err(|e| {
+            log::warn!(
+                "Error while reading metadata of {path:?}: {e}",
+                path = entry.path()
+            );
+        })
+        .ok()?
+        .len();
+
+    // Don't bother for empty files
+    (file_size != 0 && min_size.is_none_or(|min_size| file_size >= min_size)).then_some(file_size)
+}
+
 /// Return true if path is on a Btrfs filesystem
 fn is_on_btrfs(path: &Path) -> nix::Result<bool> {
     let statfs = nix::sys::statfs::statfs(path)?;
@@ -207,29 +221,26 @@ fn main() -> anyhow::Result<()> {
     progress.enable_steady_tick(Duration::from_millis(300));
     let progress_counters = Arc::new(ProgressCounters::new());
 
-    crossbeam_utils::thread::scope(|scope| -> anyhow::Result<()> {
+    thread::scope(|scope| -> anyhow::Result<()> {
         // Worker threads
-        for _ in 0..max(cpu_count - 1, 1) {
+        let worker_count = max(cpu_count - 1, 1);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
             // Per thread clones
             let to_hashed_rx = to_hashed_rx.clone();
             let hashed_tx = hashed_tx.clone();
             let progress = progress.clone();
             let progress_counters = Arc::clone(&progress_counters);
 
-            scope.spawn(move |_| -> anyhow::Result<()> {
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
                 let mut hasher = xxh3::Xxh3::new();
                 let mut buffer = vec![0; READ_BUFFER_SIZE];
                 while let Ok((path, file_size)) = to_hashed_rx.recv() {
-                    let file = match File::open(&path) {
-                        Ok(file) => file,
-                        Err(e) => {
-                            log::warn!("Error while opening {path:?}: {e}");
-                            continue;
-                        }
+                    let Ok(hash) = hash_file(&path, &mut hasher, &mut buffer).inspect_err(|e| {
+                        log::warn!("Error while hashing {path:?}: {e}");
+                    }) else {
+                        continue;
                     };
-
-                    let mut reader = BufReader::new(file);
-                    let hash = compute_xxh(&mut hasher, &mut reader, &mut buffer)?;
 
                     log::debug!("{path:?} {hash:016x}");
                     progress_counters.hash.fetch_add(1, Ordering::AcqRel);
@@ -239,7 +250,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 Ok(())
-            });
+            }));
         }
         drop(to_hashed_rx);
         drop(hashed_tx);
@@ -258,16 +269,9 @@ fn main() -> anyhow::Result<()> {
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                let file_size = entry.metadata()?.len();
-                if file_size == 0 {
-                    // Don't bother for empty files
+                let Some(file_size) = wanted_file_size(&entry, cl_opts.min_size) else {
                     continue;
-                }
-                if let Some(min_size) = cl_opts.min_size {
-                    if file_size < min_size {
-                        continue;
-                    }
-                }
+                };
                 let path = entry.path();
                 log::debug!("{path:?}");
                 progress_counters.file.fetch_add(1, Ordering::AcqRel);
@@ -324,16 +328,9 @@ fn main() -> anyhow::Result<()> {
                     );
                     btrfs_checked = true;
                 }
-                let file_size = entry.metadata()?.len();
-                if file_size == 0 {
-                    // Don't bother for empty files
+                let Some(file_size) = wanted_file_size(&entry, cl_opts.min_size) else {
                     continue;
-                }
-                if let Some(min_size) = cl_opts.min_size {
-                    if file_size < min_size {
-                        continue;
-                    }
-                }
+                };
                 log::debug!("{path:?}");
                 progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
@@ -347,9 +344,14 @@ fn main() -> anyhow::Result<()> {
         for (filepath, file_size, hash) in &hashed_rx {
             files.insert((file_size, hash), filepath);
         }
-        Ok(())
-    })
-    .map_err(|e| anyhow::anyhow!("Worker thread error: {e:?}"))??;
+
+        // Workers have all completed once their channel ends were dropped above, so this does not block
+        workers.into_iter().try_for_each(|worker| {
+            worker
+                .join()
+                .map_err(|e| anyhow::anyhow!("Worker thread panicked: {e:?}"))?
+        })
+    })?;
 
     // Remove unique hashes
     for key in files
