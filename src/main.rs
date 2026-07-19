@@ -396,7 +396,7 @@ fn main() -> anyhow::Result<()> {
 
     // Find candidates
     let mut stdout = io::stdout().lock();
-    for ((_file_size, _file_hash), filepaths) in files.iter_all_mut() {
+    for ((_file_size, _file_hash), filepaths) in files.iter_all() {
         let first = filepaths.first().unwrap();
         for other in filepaths.iter().skip(1) {
             if !same_content(first, other)? {
