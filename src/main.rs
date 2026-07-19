@@ -273,7 +273,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             let mut stdin_locked = io::stdin().lock();
             let mut buf = Vec::new();
-            let mut first = false;
+            let mut btrfs_checked = false;
             loop {
                 buf.clear();
                 if stdin_locked.read_until(0, &mut buf)? == 0 {
@@ -296,12 +296,12 @@ fn main() -> anyhow::Result<()> {
                     log::warn!("{path:?} is not a file, ignoring it");
                     continue;
                 }
-                if !first {
+                if !btrfs_checked {
                     anyhow::ensure!(
                         is_on_btrfs(path)?,
                         "Input file {path:?} is not on a Btrfs filesystem"
                     );
-                    first = false;
+                    btrfs_checked = true;
                 }
                 let file_size = entry.metadata()?.len();
                 if file_size == 0 {
