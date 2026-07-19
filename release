@@ -2,23 +2,25 @@
 
 set -o pipefail
 
-readonly VERSION=${1:?}
+readonly VERSION="${1:?}"
 
+cd "$(jj root)"
 
-cd "$(git rev-parse --show-toplevel)"
+if jj show --stat | tail -n -1 | grep -q '^0 files changed'
+then
+  jj describe -m "chore: version ${VERSION}"
+else
+  jj new -m "chore: version ${VERSION}"
+fi
 
-sed -i "s/^\(version = \"\).*\(\"\)/\1$VERSION\2/w /dev/stdout" Cargo.toml
+cargo set-version "${VERSION}"
 
+cargo upgrade
 cargo update
-cargo check && cargo test
 
-git add Cargo.{toml,lock}
-
-git commit -m "chore: version ${VERSION}"
-git tag -m "Version ${VERSION}" "${VERSION}"
-
-git cliff 1.0.0..HEAD > CHANGELOG.md
-git add CHANGELOG.md
-git commit --amend --no-edit
+cargo check
+cargo test
 
 git tag -f -m "Version ${VERSION}" "${VERSION}"
+
+jj new
