@@ -68,7 +68,7 @@ struct ProgressCounters {
     file: AtomicUsize,
     /// Number of files that were hashed
     hash: AtomicUsize,
-    /// Number of hash collisions
+    /// Number of extra contents found among files sharing a size and hash
     hash_collision: AtomicUsize,
     /// Number of identical files already reflinked
     reflinked: AtomicUsize,
@@ -124,6 +124,25 @@ fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
         }
     }
     Ok(true)
+}
+
+/// Partition files sharing a size and hash into classes of identical content
+///
+/// Each class is its first member, standing for the whole class, followed by the others. More than one class means
+/// the hash collided.
+fn content_classes(filepaths: &[PathBuf]) -> Result<Vec<(&Path, Vec<&Path>)>, io::Error> {
+    let mut classes: Vec<(&Path, Vec<&Path>)> = Vec::new();
+    'filepath: for filepath in filepaths {
+        for (representative, others) in &mut classes {
+            // Content equality is transitive, so comparing against one member settles the whole class
+            if same_content(representative, filepath)? {
+                others.push(filepath);
+                continue 'filepath;
+            }
+        }
+        classes.push((filepath, Vec::new()));
+    }
+    Ok(classes)
 }
 
 /// How two identical files relate on disk
@@ -409,39 +428,41 @@ fn main() -> anyhow::Result<()> {
     // Find candidates
     let mut stdout = io::stdout().lock();
     for ((_file_size, _file_hash), filepaths) in files.iter_all() {
-        let first = filepaths.first().unwrap();
-        for other in filepaths.iter().skip(1) {
-            if !same_content(first, other)? {
-                log::warn!(
-                    "Files {first:?} and {other:?} have the same size and hash but not the same content"
-                );
-                progress_counters
-                    .hash_collision
-                    .fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{progress_counters}"));
-                continue;
-            }
-
-            match compare_extents(&file_extents(first)?, &file_extents(other)?) {
-                ExtentSharing::Shared => {
-                    log::debug!("Files {first:?} and {other:?} are already reflinked");
-                    progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
-                }
-                ExtentSharing::Inlined => {
-                    log::debug!(
-                        "Files {first:?} and {other:?} have inlined data, reflinking them would not free space"
-                    );
-                    progress_counters.inlined.fetch_add(1, Ordering::AcqRel);
-                }
-                ExtentSharing::Distinct => {
-                    log::debug!("Files {first:?} and {other:?} are duplicates");
-                    progress_counters
-                        .duplicate_candidate
-                        .fetch_add(1, Ordering::AcqRel);
-                    write_pair(&mut stdout, first, other)?;
-                }
-            }
+        let classes = content_classes(filepaths)?;
+        if classes.len() > 1 {
+            log::warn!(
+                "Files {filepaths:?} have the same size and hash but {count} distinct contents",
+                count = classes.len()
+            );
+            progress_counters
+                .hash_collision
+                .fetch_add(classes.len() - 1, Ordering::AcqRel);
             progress.set_message(format!("{progress_counters}"));
+        }
+
+        for (first, others) in classes {
+            for other in others {
+                match compare_extents(&file_extents(first)?, &file_extents(other)?) {
+                    ExtentSharing::Shared => {
+                        log::debug!("Files {first:?} and {other:?} are already reflinked");
+                        progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
+                    }
+                    ExtentSharing::Inlined => {
+                        log::debug!(
+                            "Files {first:?} and {other:?} have inlined data, reflinking would not free space"
+                        );
+                        progress_counters.inlined.fetch_add(1, Ordering::AcqRel);
+                    }
+                    ExtentSharing::Distinct => {
+                        log::debug!("Files {first:?} and {other:?} are duplicates");
+                        progress_counters
+                            .duplicate_candidate
+                            .fetch_add(1, Ordering::AcqRel);
+                        write_pair(&mut stdout, first, other)?;
+                    }
+                }
+                progress.set_message(format!("{progress_counters}"));
+            }
         }
     }
 
@@ -556,6 +577,63 @@ mod tests {
     #[should_panic(expected = "assertion `left == right` failed")]
     fn same_content_rejects_different_sizes() {
         compare_content(b"aa", b"a");
+    }
+
+    /// Write the given contents, in order, as files of a same size and hash group
+    fn write_group(dir: &Path, contents: &[&[u8]]) -> Vec<PathBuf> {
+        contents
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                let path = dir.join(index.to_string());
+                fs::write(&path, content).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn content_classes_identical_files_form_one_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = write_group(dir.path(), &[b"dup", b"dup", b"dup"]);
+
+        assert_eq!(
+            content_classes(&paths).unwrap(),
+            vec![(
+                paths[0].as_path(),
+                vec![paths[1].as_path(), paths[2].as_path()]
+            )]
+        );
+    }
+
+    #[test]
+    fn content_classes_collision_keeps_duplicates_of_other_classes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The first file colliding with the rest is what hides the duplicates behind it
+        let paths = write_group(dir.path(), &[b"odd", b"dup", b"dup"]);
+
+        assert_eq!(
+            content_classes(&paths).unwrap(),
+            vec![
+                (paths[0].as_path(), vec![]),
+                (paths[1].as_path(), vec![paths[2].as_path()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn content_classes_all_distinct_files_are_singletons() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = write_group(dir.path(), &[b"aaa", b"bbb", b"ccc"]);
+
+        assert_eq!(
+            content_classes(&paths).unwrap(),
+            vec![
+                (paths[0].as_path(), vec![]),
+                (paths[1].as_path(), vec![]),
+                (paths[2].as_path(), vec![]),
+            ]
+        );
     }
 
     #[test]
