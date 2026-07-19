@@ -340,7 +340,7 @@ fn main() -> anyhow::Result<()> {
                 let entry = match walkdir::WalkDir::new(path)
                     .into_iter()
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("Woot"))?
+                    .ok_or_else(|| anyhow::anyhow!("Walking {path:?} yielded no entry"))?
                 {
                     Ok(entry) => entry,
                     Err(e) => {
