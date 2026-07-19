@@ -12,6 +12,12 @@
 - Test: `cargo test --all-features`
 - Single test: `cargo test <test_name>`
 
+### Test environment
+
+Tests exercising extent layout or subvolumes need a scratch directory on Btrfs, and use `target/` for it. When `target/` is on another filesystem they print a skip notice and **pass without testing anything**, so a green run there proves nothing about them.
+
+Subvolume tests additionally shell out to the `btrfs` binary (`btrfs-progs`), and fail if it is missing. They need no privileges: creating a subvolume only requires write permission on the parent directory, and `remove_dir_all` clears one on cleanup.
+
 ## Code Style
 
 - Strict Clippy: pedantic + many restriction lints (see `[lints.clippy]` in Cargo.toml)

@@ -67,6 +67,7 @@ dependencies = [
  "crossbeam-channel",
  "fiemap",
  "indicatif",
+ "linux-raw-sys",
  "log",
  "multimap",
  "nix",

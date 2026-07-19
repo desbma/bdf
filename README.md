@@ -52,6 +52,8 @@ bdf target_dir | xargs -0 -r -p -n 2 cp -v --reflink=always
 
 You will need to confirm before each deduplication (due to `xargs` `-p` switch). Be careful because if a file is modified during the analysis, it may get deduplicated although the pair of files are not identical anymore.
 
+Reflinking a pair whose files sit in subvolumes mounted separately needs Linux 5.18 or later. Earlier kernels restrict `FICLONE` to a single mount point, and `cp` fails with `EXDEV` even though both files belong to the same filesystem.
+
 ## License
 
 [GPLv3](./LICENSE)

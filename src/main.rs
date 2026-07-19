@@ -5,9 +5,13 @@ use std::{
     collections::hash_map::{Entry, HashMap},
     ffi::OsStr,
     fmt,
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader, Read as _, Write},
-    os::unix::ffi::OsStrExt as _,
+    mem::zeroed,
+    os::{
+        fd::AsRawFd as _,
+        unix::{ffi::OsStrExt as _, fs::MetadataExt as _},
+    },
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -19,6 +23,7 @@ use std::{
 
 use anyhow::Context as _;
 use clap::Parser;
+use linux_raw_sys::btrfs::btrfs_ioctl_fs_info_args;
 use multimap::MultiMap;
 use xxhash_rust::xxh3;
 
@@ -31,6 +36,91 @@ const UNRESOLVED_EXTENT_FLAGS: fiemap::FiemapExtentFlags =
 
 /// Convenience type for a pair of crossbeam channel ends
 type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>);
+
+/// Identifier of a Btrfs filesystem, the same for all of its subvolumes
+type BtrfsFsid = [u8; 16];
+
+nix::ioctl_read!(
+    /// Query the Btrfs filesystem holding an open file
+    btrfs_fs_info,
+    0x94,
+    31,
+    btrfs_ioctl_fs_info_args
+);
+
+/// Return the identifier of the Btrfs filesystem holding `path`, `None` if it is not on Btrfs
+fn btrfs_fsid(path: &Path) -> Result<Option<BtrfsFsid>, io::Error> {
+    let file = File::open(path)?;
+    // SAFETY: every field is an integer, for which zero is a valid value
+    let mut args: btrfs_ioctl_fs_info_args = unsafe { zeroed() };
+    // SAFETY: the ioctl writes at most `size_of::<btrfs_ioctl_fs_info_args>()` bytes to `args`
+    match unsafe { btrfs_fs_info(file.as_raw_fd(), &raw mut args) } {
+        Ok(_) => Ok(Some(args.fsid)),
+        // Any other filesystem leaves the ioctl unimplemented
+        Err(nix::errno::Errno::ENOTTY) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A single Btrfs filesystem, which reflinks can not reach outside of
+struct BtrfsFilesystem {
+    /// Identifier of the filesystem
+    fsid: BtrfsFsid,
+    /// Whether a device belongs to the filesystem, cached to keep the ioctl off the per file path
+    devices: HashMap<u64, bool>,
+}
+
+impl BtrfsFilesystem {
+    /// Identify the Btrfs filesystem holding `path`, if any
+    fn containing(path: &Path) -> Result<Option<Self>, io::Error> {
+        Ok(btrfs_fsid(path)?.map(|fsid| Self {
+            fsid,
+            devices: HashMap::new(),
+        }))
+    }
+
+    /// Test whether `path`, sitting on device `device`, is on this filesystem
+    ///
+    /// Each subvolume has its own device, so the device alone does not settle it.
+    fn holds(&mut self, path: &Path, device: u64) -> Result<bool, io::Error> {
+        if let Some(&known) = self.devices.get(&device) {
+            return Ok(known);
+        }
+        let holds = btrfs_fsid(path)? == Some(self.fsid);
+        self.devices.insert(device, holds);
+        Ok(holds)
+    }
+}
+
+/// Walk a directory tree, without leaving the Btrfs filesystem it starts on
+///
+/// Subvolumes of a filesystem each have their own device, so pruning on a device change would skip them, while
+/// reflinking across them is perfectly valid.
+fn walk_btrfs_dir(
+    input_dir: &Path,
+) -> anyhow::Result<impl Iterator<Item = walkdir::Result<walkdir::DirEntry>>> {
+    let mut filesystem = BtrfsFilesystem::containing(input_dir)
+        .with_context(|| format!("Failed to identify the filesystem of {input_dir:?}"))?
+        .with_context(|| format!("{input_dir:?} is not on a Btrfs filesystem"))?;
+    Ok(walkdir::WalkDir::new(input_dir)
+        .into_iter()
+        .filter_entry(move |entry| {
+            // A regular file can be a mount point of its own, so checking directories alone would let one through
+            let file_type = entry.file_type();
+            if !file_type.is_dir() && !file_type.is_file() {
+                return true;
+            }
+            let path = entry.path();
+            entry
+                .metadata()
+                .map_err(io::Error::from)
+                .and_then(|metadata| filesystem.holds(path, metadata.dev()))
+                .unwrap_or_else(|e| {
+                    log::warn!("Error while identifying the filesystem of {path:?}: {e}");
+                    false
+                })
+        }))
+}
 
 /// Command line arguments
 #[derive(Debug, Parser)]
@@ -231,27 +321,17 @@ where
     writer.write_all(b"\0")
 }
 
-/// Return the size when the entry should be hashed
-fn wanted_file_size(entry: &walkdir::DirEntry, min_size: Option<u64>) -> Option<u64> {
-    let file_size = entry
-        .metadata()
-        .inspect_err(|e| {
-            log::warn!(
-                "Error while reading metadata of {path:?}: {e}",
-                path = entry.path()
-            );
-        })
-        .ok()?
-        .len();
-
-    // Don't bother for empty files
-    (file_size != 0 && min_size.is_none_or(|min_size| file_size >= min_size)).then_some(file_size)
+/// Read path metadata without following symlinks, warning when it can not be read
+fn path_metadata(path: &Path) -> Option<fs::Metadata> {
+    fs::symlink_metadata(path)
+        .inspect_err(|e| log::warn!("Error while reading metadata of {path:?}: {e}"))
+        .ok()
 }
 
-/// Return true if path is on a Btrfs filesystem
-fn is_on_btrfs(path: &Path) -> nix::Result<bool> {
-    let statfs = nix::sys::statfs::statfs(path)?;
-    Ok(statfs.filesystem_type() == nix::sys::statfs::BTRFS_SUPER_MAGIC)
+/// Return the size when a file this large should be hashed
+fn wanted_file_size(file_size: u64, min_size: Option<u64>) -> Option<u64> {
+    // Don't bother for empty files
+    (file_size != 0 && min_size.is_none_or(|minimum| file_size >= minimum)).then_some(file_size)
 }
 
 #[expect(clippy::too_many_lines)]
@@ -264,12 +344,7 @@ fn main() -> anyhow::Result<()> {
     // Parse command line opts
     let cl_opts = CommandLineOpts::parse();
     log::trace!("{cl_opts:?}");
-    if let Some(input_dir) = cl_opts.dir.as_ref() {
-        anyhow::ensure!(
-            is_on_btrfs(input_dir)?,
-            "Input directory {input_dir:?} is not on a Btrfs filesystem"
-        );
-    }
+    let dir_walk = cl_opts.dir.as_deref().map(walk_btrfs_dir).transpose()?;
 
     // Get usable core count
     let cpu_count = thread::available_parallelism()?.get();
@@ -324,8 +399,8 @@ fn main() -> anyhow::Result<()> {
 
         // Iterate over files
         let mut entry_map: HashMap<u64, Option<walkdir::DirEntry>> = HashMap::new();
-        if let Some(input_dir) = cl_opts.dir {
-            for entry in walkdir::WalkDir::new(input_dir).same_file_system(true) {
+        if let Some(dir_walk) = dir_walk {
+            for entry in dir_walk {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
@@ -336,7 +411,10 @@ fn main() -> anyhow::Result<()> {
                 if !entry.file_type().is_file() {
                     continue;
                 }
-                let Some(file_size) = wanted_file_size(&entry, cl_opts.min_size) else {
+                let Some(metadata) = path_metadata(entry.path()) else {
+                    continue;
+                };
+                let Some(file_size) = wanted_file_size(metadata.len(), cl_opts.min_size) else {
                     continue;
                 };
                 let path = entry.path();
@@ -364,31 +442,41 @@ fn main() -> anyhow::Result<()> {
         } else {
             let mut stdin_locked = io::stdin().lock();
             let mut buf = Vec::new();
-            let mut btrfs_checked = false;
+            // Reflinks can not cross filesystems, so every input has to be on the one the first input is on
+            let mut filesystem: Option<BtrfsFilesystem> = None;
             while let Some(path) = read_nul_path(&mut stdin_locked, &mut buf)? {
-                let entry = match walkdir::WalkDir::new(path)
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Walking {path:?} yielded no entry"))?
-                {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        log::warn!("{e}");
-                        continue;
-                    }
+                let Some(metadata) = path_metadata(path) else {
+                    continue;
                 };
-                if !entry.file_type().is_file() {
+                if !metadata.is_file() {
                     log::warn!("{path:?} is not a file, ignoring it");
                     continue;
                 }
-                if !btrfs_checked {
-                    anyhow::ensure!(
-                        is_on_btrfs(path)?,
-                        "Input file {path:?} is not on a Btrfs filesystem"
-                    );
-                    btrfs_checked = true;
+                // A file that can not be opened is skipped rather than fatal, as it would be when hashing it
+                let filesystem = match filesystem {
+                    Some(ref mut filesystem) => filesystem,
+                    None => match BtrfsFilesystem::containing(path) {
+                        Ok(Some(found)) => filesystem.insert(found),
+                        Ok(None) => {
+                            anyhow::bail!("Input file {path:?} is not on a Btrfs filesystem")
+                        }
+                        Err(e) => {
+                            log::warn!("Error while identifying the filesystem of {path:?}: {e}");
+                            continue;
+                        }
+                    },
+                };
+                match filesystem.holds(path, metadata.dev()) {
+                    Ok(true) => {}
+                    Ok(false) => anyhow::bail!(
+                        "Input file {path:?} is not on the same Btrfs filesystem as the first input file"
+                    ),
+                    Err(e) => {
+                        log::warn!("Error while identifying the filesystem of {path:?}: {e}");
+                        continue;
+                    }
                 }
-                let Some(file_size) = wanted_file_size(&entry, cl_opts.min_size) else {
+                let Some(file_size) = wanted_file_size(metadata.len(), cl_opts.min_size) else {
                     continue;
                 };
                 log::debug!("{path:?}");
@@ -471,7 +559,10 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Seek as _};
+    use std::{
+        io::Seek as _,
+        process::{Command, Stdio},
+    };
 
     use super::*;
 
@@ -483,15 +574,28 @@ mod tests {
 
     /// Temporary directory under the build directory, `None` when it is not on a Btrfs filesystem
     ///
-    /// Extent layout is filesystem specific, so tests relying on it can only run on Btrfs.
+    /// Extent layout and subvolumes are filesystem specific, so tests relying on them can only run on Btrfs.
     fn btrfs_test_dir() -> Option<tempfile::TempDir> {
         let base = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
-        if is_on_btrfs(base).unwrap() {
+        if btrfs_fsid(base).unwrap().is_some() {
             Some(tempfile::TempDir::new_in(base).unwrap())
         } else {
             eprintln!("Skipping test, {base:?} is not on a Btrfs filesystem");
             None
         }
+    }
+
+    /// Create a Btrfs subvolume named `name` under `parent`, which needs the `btrfs` binary
+    fn create_subvolume(parent: &Path, name: &str) -> PathBuf {
+        let path = parent.join(name);
+        let status = Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        path
     }
 
     /// Build incompressible bytes, so that transparent compression does not alter the extent layout
@@ -943,6 +1047,57 @@ mod tests {
         assert_eq!(
             read_nul_path(&mut reader, &mut buf).unwrap(),
             Some(Path::new(OsStr::from_bytes(b"/a\xff/b")))
+        );
+    }
+
+    #[test]
+    fn btrfs_fsid_of_other_filesystem_is_none() {
+        assert_eq!(btrfs_fsid(Path::new("/proc")).unwrap(), None);
+    }
+
+    #[test]
+    fn btrfs_fsid_of_regular_file_of_other_filesystem_is_none() {
+        assert_eq!(btrfs_fsid(Path::new("/proc/self/status")).unwrap(), None);
+    }
+
+    #[test]
+    fn btrfs_fsid_is_shared_by_subvolumes_holding_distinct_devices() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let subvolume = create_subvolume(dir.path(), "subvolume");
+
+        assert_ne!(
+            fs::metadata(&subvolume).unwrap().dev(),
+            fs::metadata(dir.path()).unwrap().dev()
+        );
+        assert_eq!(
+            btrfs_fsid(&subvolume).unwrap(),
+            btrfs_fsid(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn walk_btrfs_dir_descends_into_subvolumes() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let subvolume = create_subvolume(dir.path(), "subvolume");
+        let nested = create_subvolume(&subvolume, "nested");
+        fs::write(dir.path().join("outside"), b"content").unwrap();
+        fs::write(subvolume.join("inside"), b"content").unwrap();
+        fs::write(nested.join("deeper"), b"content").unwrap();
+
+        let mut walked: Vec<PathBuf> = walk_btrfs_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().into_path())
+            .filter(|path| path.is_file())
+            .collect();
+        walked.sort();
+
+        assert_eq!(
+            walked,
+            vec![
+                dir.path().join("outside"),
+                subvolume.join("inside"),
+                nested.join("deeper"),
+            ]
         );
     }
 }
