@@ -6,7 +6,7 @@ use std::{
     ffi::OsStr,
     fmt,
     fs::File,
-    io::{self, BufRead, BufReader, Read as _},
+    io::{self, BufRead, BufReader, Read as _, Write},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -154,6 +154,17 @@ where
         buf.pop();
     }
     Ok(Some(Path::new(OsStr::from_bytes(buf))))
+}
+
+/// Write a NUL terminated duplicate pair
+fn write_pair<W>(writer: &mut W, first: &Path, second: &Path) -> Result<(), io::Error>
+where
+    W: Write,
+{
+    writer.write_all(first.as_os_str().as_bytes())?;
+    writer.write_all(b"\0")?;
+    writer.write_all(second.as_os_str().as_bytes())?;
+    writer.write_all(b"\0")
 }
 
 /// Return true if path is on a Btrfs filesystem
@@ -351,6 +362,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Find candidates
+    let mut stdout = io::stdout().lock();
     for ((_file_size, _file_hash), filepaths) in files.iter_all_mut() {
         let first = filepaths.first().unwrap();
         for other in filepaths.iter().skip(1) {
@@ -372,16 +384,12 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            log::debug!(
-                "Files {:?} and {:?} are duplicates",
-                first.to_str().unwrap(),
-                other.to_str().unwrap()
-            );
+            log::debug!("Files {first:?} and {other:?} are duplicates");
             progress_counters
                 .duplicate_candidate
                 .fetch_add(1, Ordering::AcqRel);
             progress.set_message(format!("{progress_counters}"));
-            print!("{}\0{}\0", first.to_str().unwrap(), other.to_str().unwrap());
+            write_pair(&mut stdout, first, other)?;
         }
     }
 
@@ -422,6 +430,25 @@ mod tests {
             Some(Path::new("/c/d"))
         );
         assert_eq!(read_nul_path(&mut reader, &mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn write_pair_utf8() {
+        let mut out = Vec::new();
+        write_pair(&mut out, Path::new("/a/b"), Path::new("/c/d")).unwrap();
+        assert_eq!(out, b"/a/b\0/c/d\0");
+    }
+
+    #[test]
+    fn write_pair_non_utf8() {
+        let mut out = Vec::new();
+        write_pair(
+            &mut out,
+            Path::new(OsStr::from_bytes(b"/a\xff/b")),
+            Path::new(OsStr::from_bytes(b"/c\xfe/d")),
+        )
+        .unwrap();
+        assert_eq!(out, b"/a\xff/b\0/c\xfe/d\0");
     }
 
     #[test]
