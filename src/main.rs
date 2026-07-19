@@ -25,6 +25,10 @@ use xxhash_rust::xxh3;
 /// File read chunk size, in bytes
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 
+/// Extent flags marking a physical location that does not identify the underlying data
+const UNRESOLVED_EXTENT_FLAGS: fiemap::FiemapExtentFlags =
+    fiemap::FiemapExtentFlags::UNKNOWN.union(fiemap::FiemapExtentFlags::DELALLOC);
+
 /// Convenience type for a pair of crossbeam channel ends
 type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>);
 
@@ -58,6 +62,7 @@ fn hash_file(path: &Path, hasher: &mut xxh3::Xxh3, buffer: &mut [u8]) -> Result<
 }
 
 /// Processing progress counters
+#[derive(Default)]
 struct ProgressCounters {
     /// Number of files that were targeted for analysis
     file: AtomicUsize,
@@ -67,32 +72,22 @@ struct ProgressCounters {
     hash_collision: AtomicUsize,
     /// Number of identical files already reflinked
     reflinked: AtomicUsize,
+    /// Number of identical files with inlined data, which reflinking can not share
+    inlined: AtomicUsize,
     /// Number of duplicate files, candidates for reflinking
     duplicate_candidate: AtomicUsize,
-}
-
-impl ProgressCounters {
-    /// Constructor
-    fn new() -> Self {
-        Self {
-            file: AtomicUsize::new(0),
-            hash: AtomicUsize::new(0),
-            hash_collision: AtomicUsize::new(0),
-            reflinked: AtomicUsize::new(0),
-            duplicate_candidate: AtomicUsize::new(0),
-        }
-    }
 }
 
 impl fmt::Display for ProgressCounters {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} files, {} hashes, {} hash collisions, {} already reflinked, {} duplicates",
+            "{} files, {} hashes, {} hash collisions, {} already reflinked, {} inlined, {} duplicates",
             self.file.load(Ordering::Relaxed),
             self.hash.load(Ordering::Relaxed),
             self.hash_collision.load(Ordering::Relaxed),
             self.reflinked.load(Ordering::Relaxed),
+            self.inlined.load(Ordering::Relaxed),
             self.duplicate_candidate.load(Ordering::Relaxed),
         )
     }
@@ -119,22 +114,58 @@ fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
     Ok(true)
 }
 
-/// Test if two identical files share the same extents
-fn same_extents(first: &Path, second: &Path) -> Result<bool, io::Error> {
-    let extents1: Vec<fiemap::FiemapExtent> =
-        fiemap::fiemap(first)?.collect::<Result<Vec<_>, _>>()?;
-    let extents2: Vec<fiemap::FiemapExtent> =
-        fiemap::fiemap(second)?.collect::<Result<Vec<_>, _>>()?;
+/// How two identical files relate on disk
+#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
+enum ExtentSharing {
+    /// Both files map to the same extents
+    Shared,
+    /// Files map to distinct extents, reflinking them would free space
+    Distinct,
+    /// Both files have their data inlined in filesystem metadata, which reflinking can not share
+    Inlined,
+}
+
+/// Map the extents of a file, flushing pending writes first
+fn file_extents(path: &Path) -> Result<Vec<fiemap::FiemapExtent>, io::Error> {
+    let file = File::open(path)?;
+    // Data under delayed allocation is reported without a location, hiding whether it will be inlined
+    file.sync_data()?;
+    fiemap::Fiemap::new(&file).collect()
+}
+
+/// Whether a file stores its data in filesystem metadata rather than in a data extent
+fn is_inlined(extents: &[fiemap::FiemapExtent]) -> bool {
+    extents.iter().any(|extent| {
+        extent
+            .fe_flags
+            .contains(fiemap::FiemapExtentFlags::DATA_INLINE)
+    })
+}
+
+/// Compare the extent maps of two identical files
+fn compare_extents(
+    extents1: &[fiemap::FiemapExtent],
+    extents2: &[fiemap::FiemapExtent],
+) -> ExtentSharing {
+    // Reflinking an inlined file onto one holding a regular extent releases that extent, so only a pair inlined
+    // on both sides has nothing to gain
+    if is_inlined(extents1) && is_inlined(extents2) {
+        return ExtentSharing::Inlined;
+    }
     if extents1.len() != extents2.len() {
-        return Ok(false);
+        return ExtentSharing::Distinct;
     }
     for (extent1, extent2) in extents1.iter().zip(extents2.iter()) {
-        if (extent1.fe_physical != extent2.fe_physical) || (extent1.fe_length != extent2.fe_length)
+        // A location left unresolved, by a write landing after the flush, is a placeholder identical between
+        // unrelated files, so it can never establish sharing
+        if (extent1.fe_flags | extent2.fe_flags).intersects(UNRESOLVED_EXTENT_FLAGS)
+            || extent1.fe_physical != extent2.fe_physical
+            || extent1.fe_length != extent2.fe_length
         {
-            return Ok(false);
+            return ExtentSharing::Distinct;
         }
     }
-    Ok(true)
+    ExtentSharing::Shared
 }
 
 /// Read a NUL terminated path into `buf`, stripping the terminator, `None` at end of input
@@ -219,7 +250,7 @@ fn main() -> anyhow::Result<()> {
     // Progress
     let progress = indicatif::ProgressBar::new_spinner();
     progress.enable_steady_tick(Duration::from_millis(300));
-    let progress_counters = Arc::new(ProgressCounters::new());
+    let progress_counters = Arc::new(ProgressCounters::default());
 
     thread::scope(|scope| -> anyhow::Result<()> {
         // Worker threads
@@ -379,19 +410,26 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            if same_extents(first, other)? {
-                log::debug!("Files {first:?} and {other:?} are already reflinked");
-                progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{progress_counters}"));
-                continue;
+            match compare_extents(&file_extents(first)?, &file_extents(other)?) {
+                ExtentSharing::Shared => {
+                    log::debug!("Files {first:?} and {other:?} are already reflinked");
+                    progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
+                }
+                ExtentSharing::Inlined => {
+                    log::debug!(
+                        "Files {first:?} and {other:?} have inlined data, reflinking them would not free space"
+                    );
+                    progress_counters.inlined.fetch_add(1, Ordering::AcqRel);
+                }
+                ExtentSharing::Distinct => {
+                    log::debug!("Files {first:?} and {other:?} are duplicates");
+                    progress_counters
+                        .duplicate_candidate
+                        .fetch_add(1, Ordering::AcqRel);
+                    write_pair(&mut stdout, first, other)?;
+                }
             }
-
-            log::debug!("Files {first:?} and {other:?} are duplicates");
-            progress_counters
-                .duplicate_candidate
-                .fetch_add(1, Ordering::AcqRel);
             progress.set_message(format!("{progress_counters}"));
-            write_pair(&mut stdout, first, other)?;
         }
     }
 
@@ -402,7 +440,316 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, io::Seek as _};
+
     use super::*;
+
+    /// Size of a file small enough for Btrfs to store its data inline in metadata
+    const INLINE_SIZE: usize = 500;
+
+    /// Size of a file too large for Btrfs to store its data inline in metadata
+    const EXTENT_SIZE: usize = 300 * 1024;
+
+    /// Temporary directory under the build directory, `None` when it is not on a Btrfs filesystem
+    ///
+    /// Extent layout is filesystem specific, so tests relying on it can only run on Btrfs.
+    fn btrfs_test_dir() -> Option<tempfile::TempDir> {
+        let base = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
+        if is_on_btrfs(base).unwrap() {
+            Some(tempfile::TempDir::new_in(base).unwrap())
+        } else {
+            eprintln!("Skipping test, {base:?} is not on a Btrfs filesystem");
+            None
+        }
+    }
+
+    /// Build incompressible bytes, so that transparent compression does not alter the extent layout
+    fn incompressible_bytes(size: usize) -> Vec<u8> {
+        (0..size.div_ceil(8))
+            .flat_map(|index| xxh3::xxh3_64(&index.to_le_bytes()).to_le_bytes())
+            .take(size)
+            .collect()
+    }
+
+    /// Write a file of `size` bytes, leaving its data under delayed allocation
+    fn write_unflushed(path: &Path, size: usize) {
+        fs::write(path, incompressible_bytes(size)).unwrap();
+    }
+
+    /// Write a file of `size` bytes and flush it, so its extents are allocated
+    fn write_flushed(path: &Path, size: usize) {
+        write_unflushed(path, size);
+        File::open(path).unwrap().sync_data().unwrap();
+    }
+
+    /// Map both files and compare them, as the candidate reporting does
+    fn compare_files(first: &Path, second: &Path) -> ExtentSharing {
+        compare_extents(
+            &file_extents(first).unwrap(),
+            &file_extents(second).unwrap(),
+        )
+    }
+
+    /// Map a file without flushing it, leaving delayed allocation unresolved
+    fn unflushed_extents(path: &Path) -> Vec<fiemap::FiemapExtent> {
+        fiemap::fiemap(path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn compare_extents_reflinked_is_shared() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_flushed(&first, EXTENT_SIZE);
+        // On Btrfs a plain copy is reflinked, sharing the extents of the source
+        fs::copy(&first, &second).unwrap();
+
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Shared);
+    }
+
+    #[test]
+    fn compare_extents_independently_written_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_flushed(&first, EXTENT_SIZE);
+        write_flushed(&second, EXTENT_SIZE);
+
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Distinct);
+    }
+
+    #[test]
+    fn compare_extents_unflushed_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_unflushed(&first, EXTENT_SIZE);
+        write_unflushed(&second, EXTENT_SIZE);
+
+        // Both files map to a placeholder extent until their delayed allocation is resolved, which would make
+        // them compare as shared
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Distinct);
+    }
+
+    #[test]
+    fn compare_extents_partially_rewritten_reflink_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_flushed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        // Rewriting identical bytes breaks sharing for that range, leaving the files identical but no longer
+        // fully reflinked
+        let mut file = File::options().write(true).open(&second).unwrap();
+        file.write_all(&incompressible_bytes(EXTENT_SIZE)[..4096])
+            .unwrap();
+        file.sync_data().unwrap();
+
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Distinct);
+    }
+
+    #[test]
+    fn compare_extents_sparse_and_dense_are_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let sparse = dir.path().join("sparse");
+        let dense = dir.path().join("dense");
+        let tail = incompressible_bytes(EXTENT_SIZE);
+
+        // A hole is not reported as an extent, unlike the zeroes it reads as
+        let mut sparse_file = File::create(&sparse).unwrap();
+        sparse_file
+            .seek(io::SeekFrom::Start(EXTENT_SIZE as u64))
+            .unwrap();
+        sparse_file.write_all(&tail).unwrap();
+        sparse_file.sync_data().unwrap();
+
+        let mut dense_file = File::create(&dense).unwrap();
+        dense_file.write_all(&vec![0; EXTENT_SIZE]).unwrap();
+        dense_file.write_all(&tail).unwrap();
+        dense_file.sync_data().unwrap();
+
+        assert_eq!(compare_files(&sparse, &dense), ExtentSharing::Distinct);
+    }
+
+    #[test]
+    fn compare_extents_independently_written_small_is_inlined() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_flushed(&first, INLINE_SIZE);
+        write_flushed(&second, INLINE_SIZE);
+
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Inlined);
+    }
+
+    #[test]
+    fn compare_extents_reflinked_small_is_inlined() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_flushed(&first, INLINE_SIZE);
+        // Btrfs copies inline data into the destination instead of sharing it
+        fs::copy(&first, &second).unwrap();
+
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Inlined);
+    }
+
+    #[test]
+    fn compare_extents_unflushed_small_is_inlined() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_unflushed(&first, INLINE_SIZE);
+        write_unflushed(&second, INLINE_SIZE);
+
+        // Delayed allocation hides that the data will be inlined, which would report the pair as a candidate
+        assert_eq!(compare_files(&first, &second), ExtentSharing::Inlined);
+    }
+
+    #[test]
+    fn compare_extents_same_size_inline_and_extent_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let inlined = dir.path().join("inlined");
+        let truncated = dir.path().join("truncated");
+        write_flushed(&inlined, INLINE_SIZE);
+        // Truncating below the inline threshold keeps the allocated extent, so files of equal size and content
+        // can differ in layout
+        write_flushed(&truncated, EXTENT_SIZE);
+        let file = File::options().write(true).open(&truncated).unwrap();
+        file.set_len(INLINE_SIZE as u64).unwrap();
+        file.sync_data().unwrap();
+
+        let inlined_extents = file_extents(&inlined).unwrap();
+        let truncated_extents = file_extents(&truncated).unwrap();
+        assert!(is_inlined(&inlined_extents));
+        assert!(!is_inlined(&truncated_extents));
+
+        // Reflinking the inlined file onto the other releases the extent it holds alone
+        assert_eq!(
+            compare_extents(&inlined_extents, &truncated_extents),
+            ExtentSharing::Distinct
+        );
+        assert_eq!(
+            compare_extents(&truncated_extents, &inlined_extents),
+            ExtentSharing::Distinct
+        );
+    }
+
+    #[test]
+    fn compare_extents_partially_shared_extent_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let whole = dir.path().join("whole");
+        let part = dir.path().join("part");
+        write_flushed(&whole, EXTENT_SIZE);
+        fs::copy(&whole, &part).unwrap();
+        // Truncating keeps the start of the reflinked extent, shortening it in place
+        let file = File::options().write(true).open(&part).unwrap();
+        file.set_len(EXTENT_SIZE as u64 / 2).unwrap();
+        file.sync_data().unwrap();
+
+        let whole_extents = file_extents(&whole).unwrap();
+        let part_extents = file_extents(&part).unwrap();
+        assert_eq!(whole_extents.len(), part_extents.len());
+        assert_eq!(whole_extents[0].fe_physical, part_extents[0].fe_physical);
+        assert_ne!(whole_extents[0].fe_length, part_extents[0].fe_length);
+
+        assert_eq!(
+            compare_extents(&whole_extents, &part_extents),
+            ExtentSharing::Distinct
+        );
+    }
+
+    #[test]
+    fn compare_extents_prefix_map_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_flushed(&path, EXTENT_SIZE);
+        // Appending to a flushed file allocates a further extent
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all(&incompressible_bytes(EXTENT_SIZE)).unwrap();
+        file.sync_data().unwrap();
+
+        let extents = file_extents(&path).unwrap();
+        assert!(extents.len() > 1);
+
+        // Every extent of the shorter map is shared, yet the files are not
+        assert_eq!(
+            compare_extents(&extents[..1], &extents),
+            ExtentSharing::Distinct
+        );
+    }
+
+    #[test]
+    fn compare_extents_unresolved_locations_are_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        write_unflushed(&first, EXTENT_SIZE);
+        write_unflushed(&second, EXTENT_SIZE);
+
+        // Covers a write landing between the flush and the mapping, which the flush in file_extents makes
+        // otherwise unreachable
+        let extents1 = unflushed_extents(&first);
+        let extents2 = unflushed_extents(&second);
+        assert!(extents1
+            .iter()
+            .chain(extents2.iter())
+            .all(|extent| extent.fe_flags.intersects(UNRESOLVED_EXTENT_FLAGS)));
+
+        assert_eq!(
+            compare_extents(&extents1, &extents2),
+            ExtentSharing::Distinct
+        );
+    }
+
+    #[test]
+    fn compare_extents_one_sided_unresolved_location_is_distinct() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_flushed(&path, EXTENT_SIZE);
+
+        // Only a synthesized map can hold an unresolved location while matching an allocated one everywhere else
+        let extents = file_extents(&path).unwrap();
+        let mut unresolved = extents.clone();
+        unresolved[0].fe_flags.insert(UNRESOLVED_EXTENT_FLAGS);
+
+        assert_eq!(
+            compare_extents(&unresolved, &extents),
+            ExtentSharing::Distinct
+        );
+        assert_eq!(
+            compare_extents(&extents, &unresolved),
+            ExtentSharing::Distinct
+        );
+    }
+
+    #[test]
+    fn file_extents_resolves_delayed_allocation() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_unflushed(&path, EXTENT_SIZE);
+
+        let extents = file_extents(&path).unwrap();
+        assert!(!extents.is_empty());
+        assert!(!extents
+            .iter()
+            .any(|extent| extent.fe_flags.intersects(UNRESOLVED_EXTENT_FLAGS)));
+    }
+
+    #[test]
+    fn file_extents_reports_inlined_data_of_unflushed_file() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_unflushed(&path, INLINE_SIZE);
+
+        let extents = file_extents(&path).unwrap();
+        assert!(extents.iter().any(|extent| extent
+            .fe_flags
+            .contains(fiemap::FiemapExtentFlags::DATA_INLINE)));
+    }
 
     #[test]
     fn read_nul_path_terminated() {

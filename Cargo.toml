@@ -21,6 +21,9 @@ simple_logger = { version = "5.2.0", default-features = false, features = ["colo
 walkdir = { version = "2.5.0", default-features = false }
 xxhash-rust = { version = "0.8.17", default-features = false, features = ["xxh3"] }
 
+[dev-dependencies]
+tempfile = { version = "3.27.0", default-features = false, features = ["getrandom"] }
+
 [lints.rust]
 # https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html
 explicit_outlives_requirements = "warn"

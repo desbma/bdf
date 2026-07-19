@@ -24,6 +24,16 @@ jobs:
         with:
           profile: minimal
           toolchain: stable
+      - run: |
+          sudo apt-get update
+          sudo apt-get install btrfs-progs
+          sudo modprobe loop
+          truncate --size 2G /tmp/bdf-tests.btrfs
+          mkfs.btrfs /tmp/bdf-tests.btrfs
+          mkdir -p target
+          sudo mount -o loop /tmp/bdf-tests.btrfs target
+          sudo chown "$(id -u):$(id -g)" target
+          test "$(findmnt --noheadings --output FSTYPE target)" = btrfs
       - run: cargo test --verbose
 
   clippy:
