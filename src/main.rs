@@ -93,21 +93,33 @@ impl fmt::Display for ProgressCounters {
     }
 }
 
-/// Test if two files of the same size have the same content
+/// Test if two files have the same content
+///
+/// Both files must be the same size: reading stops at the end of `first`, so a longer `second` compares equal.
 fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
     let file1 = File::open(first)?;
     let file2 = File::open(second)?;
+    debug_assert_eq!(file1.metadata()?.len(), file2.metadata()?.len());
     let mut reader1 = BufReader::new(file1);
     let mut reader2 = BufReader::new(file2);
-    let mut buffer1 = vec![0; READ_BUFFER_SIZE];
-    let mut buffer2 = vec![0; READ_BUFFER_SIZE];
+    let mut buffer1 = Vec::with_capacity(READ_BUFFER_SIZE);
+    let mut buffer2 = Vec::with_capacity(READ_BUFFER_SIZE);
     loop {
-        let rd_count = reader1.read(&mut buffer1)?;
-        if rd_count == 0 {
+        // Unlike a bare read, read_to_end fills the whole chunk, resuming when a signal interrupts it
+        buffer1.clear();
+        reader1
+            .by_ref()
+            .take(READ_BUFFER_SIZE as u64)
+            .read_to_end(&mut buffer1)?;
+        if buffer1.is_empty() {
             break;
         }
-        reader2.read_exact(&mut buffer2[0..rd_count])?;
-        if buffer1[0..rd_count] != buffer2[0..rd_count] {
+        buffer2.clear();
+        reader2
+            .by_ref()
+            .take(READ_BUFFER_SIZE as u64)
+            .read_to_end(&mut buffer2)?;
+        if buffer1 != buffer2 {
             return Ok(false);
         }
     }
@@ -496,6 +508,54 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    /// Write two files and compare their content, as the candidate reporting does
+    fn compare_content(first_content: &[u8], second_content: &[u8]) -> bool {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::write(&first, first_content).unwrap();
+        fs::write(&second, second_content).unwrap();
+
+        same_content(&first, &second).unwrap()
+    }
+
+    #[test]
+    fn same_content_identical_spanning_chunks() {
+        let content = incompressible_bytes(READ_BUFFER_SIZE * 2 + 100);
+
+        assert!(compare_content(&content, &content));
+    }
+
+    #[test]
+    fn same_content_differing_at_chunk_boundary() {
+        let content = incompressible_bytes(READ_BUFFER_SIZE * 2);
+        let mut other = content.clone();
+        other[READ_BUFFER_SIZE] ^= 0xff;
+
+        assert!(!compare_content(&content, &other));
+    }
+
+    #[test]
+    fn same_content_differing_in_last_partial_chunk() {
+        let content = incompressible_bytes(READ_BUFFER_SIZE + 100);
+        let mut other = content.clone();
+        *other.last_mut().unwrap() ^= 0xff;
+
+        assert!(!compare_content(&content, &other));
+    }
+
+    #[test]
+    fn same_content_empty() {
+        assert!(compare_content(b"", b""));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn same_content_rejects_different_sizes() {
+        compare_content(b"aa", b"a");
     }
 
     #[test]
