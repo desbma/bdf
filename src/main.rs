@@ -48,15 +48,20 @@ pub struct CommandLineOpts {
 }
 
 /// Compute an XXH3-64 non-cryptographic file hash
-fn hash_file(path: &Path, hasher: &mut xxh3::Xxh3, buffer: &mut [u8]) -> Result<u64, io::Error> {
+fn hash_file(path: &Path, hasher: &mut xxh3::Xxh3, buffer: &mut Vec<u8>) -> Result<u64, io::Error> {
     let mut reader = BufReader::new(File::open(path)?);
     hasher.reset();
     loop {
-        let rd_count = reader.read(buffer)?;
-        hasher.update(&buffer[..rd_count]);
-        if rd_count == 0 {
+        // Unlike a bare read, read_to_end fills the whole chunk, resuming when a signal interrupts it
+        buffer.clear();
+        reader
+            .by_ref()
+            .take(READ_BUFFER_SIZE as u64)
+            .read_to_end(buffer)?;
+        if buffer.is_empty() {
             break;
         }
+        hasher.update(buffer);
     }
     Ok(hasher.digest())
 }
@@ -296,7 +301,7 @@ fn main() -> anyhow::Result<()> {
 
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
                 let mut hasher = xxh3::Xxh3::new();
-                let mut buffer = vec![0; READ_BUFFER_SIZE];
+                let mut buffer = Vec::with_capacity(READ_BUFFER_SIZE);
                 while let Ok((path, file_size)) = to_hashed_rx.recv() {
                     let Ok(hash) = hash_file(&path, &mut hasher, &mut buffer).inspect_err(|e| {
                         log::warn!("Error while hashing {path:?}: {e}");
@@ -346,20 +351,13 @@ fn main() -> anyhow::Result<()> {
                         // First file for this size, keep entry and move along
                         e.insert(Some(entry));
                     }
-                    Entry::Occupied(e) => {
-                        match e.get() {
-                            Some(_) => {
-                                // Second file for this size, send this one and the previous to the channel, and set map
-                                // so the next ones will be sent immediately
-                                let prev_entry = e.into_mut().take().unwrap();
-                                to_hashed_tx.send((prev_entry.path().to_path_buf(), file_size))?;
-                                to_hashed_tx.send((path.to_path_buf(), file_size))?;
-                            }
-                            None => {
-                                // Not the first file not second for this size, send it to channel immediately
-                                to_hashed_tx.send((path.to_path_buf(), file_size))?;
-                            }
+                    Entry::Occupied(mut e) => {
+                        // The first file of a size is held back until a second one shows up, so it is only hashed
+                        // once it can have a duplicate
+                        if let Some(prev_entry) = e.get_mut().take() {
+                            to_hashed_tx.send((prev_entry.path().to_path_buf(), file_size))?;
                         }
+                        to_hashed_tx.send((path.to_path_buf(), file_size))?;
                     }
                 }
             }
