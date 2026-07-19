@@ -6,7 +6,7 @@ use std::{
     ffi::OsStr,
     fmt,
     fs::File,
-    io::{self, BufRead as _, BufReader, Read as _},
+    io::{self, BufRead, BufReader, Read as _},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -138,6 +138,22 @@ fn same_extents(first: &Path, second: &Path) -> Result<bool, io::Error> {
         }
     }
     Ok(true)
+}
+
+/// Read a NUL terminated path into `buf`, stripping the terminator, `None` at end of input
+fn read_nul_path<'b, R>(reader: &mut R, buf: &'b mut Vec<u8>) -> Result<Option<&'b Path>, io::Error>
+where
+    R: BufRead,
+{
+    buf.clear();
+    if reader.read_until(0, buf)? == 0 {
+        return Ok(None);
+    }
+    // Last path may not be terminated if input does not end with a separator
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    Ok(Some(Path::new(OsStr::from_bytes(buf))))
 }
 
 /// Return true if path is on a Btrfs filesystem
@@ -274,13 +290,7 @@ fn main() -> anyhow::Result<()> {
             let mut stdin_locked = io::stdin().lock();
             let mut buf = Vec::new();
             let mut btrfs_checked = false;
-            loop {
-                buf.clear();
-                if stdin_locked.read_until(0, &mut buf)? == 0 {
-                    break;
-                }
-                buf.truncate(buf.len() - 1);
-                let path = Path::new(OsStr::from_bytes(&buf));
+            while let Some(path) = read_nul_path(&mut stdin_locked, &mut buf)? {
                 let entry = match walkdir::WalkDir::new(path)
                     .into_iter()
                     .next()
@@ -378,4 +388,49 @@ fn main() -> anyhow::Result<()> {
     progress.finish();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_nul_path_terminated() {
+        let mut reader = &b"/a/b\0/c/d\0"[..];
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_nul_path(&mut reader, &mut buf).unwrap(),
+            Some(Path::new("/a/b"))
+        );
+        assert_eq!(
+            read_nul_path(&mut reader, &mut buf).unwrap(),
+            Some(Path::new("/c/d"))
+        );
+        assert_eq!(read_nul_path(&mut reader, &mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn read_nul_path_unterminated_last() {
+        let mut reader = &b"/a/b\0/c/d"[..];
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_nul_path(&mut reader, &mut buf).unwrap(),
+            Some(Path::new("/a/b"))
+        );
+        assert_eq!(
+            read_nul_path(&mut reader, &mut buf).unwrap(),
+            Some(Path::new("/c/d"))
+        );
+        assert_eq!(read_nul_path(&mut reader, &mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn read_nul_path_non_utf8() {
+        let mut reader = &b"/a\xff/b\0"[..];
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_nul_path(&mut reader, &mut buf).unwrap(),
+            Some(Path::new(OsStr::from_bytes(b"/a\xff/b")))
+        );
+    }
 }
