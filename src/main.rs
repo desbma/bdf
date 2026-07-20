@@ -7,6 +7,7 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, BufRead, Read as _, Write},
+    iter,
     mem::zeroed,
     os::{
         fd::AsRawFd as _,
@@ -32,6 +33,13 @@ const READ_BUFFER_SIZE: usize = 256 * 1024;
 /// Extent flags marking a physical location that does not identify the underlying data
 const UNRESOLVED_EXTENT_FLAGS: fiemap::FiemapExtentFlags =
     fiemap::FiemapExtentFlags::UNKNOWN.union(fiemap::FiemapExtentFlags::DELALLOC);
+
+/// Extent flags marking a location that can never establish sharing
+///
+/// Inlined data, which Btrfs copies into the destination rather than sharing, and a location left unresolved are
+/// both placeholders identical between unrelated files.
+const UNSHAREABLE_EXTENT_FLAGS: fiemap::FiemapExtentFlags =
+    UNRESOLVED_EXTENT_FLAGS.union(fiemap::FiemapExtentFlags::DATA_INLINE);
 
 /// Convenience type for a pair of crossbeam channel ends
 type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>);
@@ -213,36 +221,6 @@ fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
     Ok(true)
 }
 
-/// Partition files sharing a size and hash into classes of identical content
-///
-/// Each class is its first member, standing for the whole class, followed by the others. More than one class means
-/// the hash collided.
-fn content_classes(filepaths: &[PathBuf]) -> Result<Vec<(&Path, Vec<&Path>)>, io::Error> {
-    let mut classes: Vec<(&Path, Vec<&Path>)> = Vec::new();
-    'filepath: for filepath in filepaths {
-        for (representative, others) in &mut classes {
-            // Content equality is transitive, so comparing against one member settles the whole class
-            if same_content(representative, filepath)? {
-                others.push(filepath);
-                continue 'filepath;
-            }
-        }
-        classes.push((filepath, Vec::new()));
-    }
-    Ok(classes)
-}
-
-/// How two identical files relate on disk
-#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
-enum ExtentSharing {
-    /// Both files map to the same extents
-    Shared,
-    /// Files map to distinct extents, reflinking them would free space
-    Distinct,
-    /// Both files have their data inlined in filesystem metadata, which reflinking can not share
-    Inlined,
-}
-
 /// Map the extents of a file, flushing pending writes first
 fn file_extents(path: &Path) -> Result<Vec<fiemap::FiemapExtent>, io::Error> {
     let file = File::open(path)?;
@@ -260,30 +238,127 @@ fn is_inlined(extents: &[fiemap::FiemapExtent]) -> bool {
     })
 }
 
-/// Compare the extent maps of two identical files
-fn compare_extents(
-    extents1: &[fiemap::FiemapExtent],
-    extents2: &[fiemap::FiemapExtent],
-) -> ExtentSharing {
-    // Reflinking an inlined file onto one holding a regular extent releases that extent, so only a pair inlined
-    // on both sides has nothing to gain
-    if is_inlined(extents1) && is_inlined(extents2) {
-        return ExtentSharing::Inlined;
-    }
-    if extents1.len() != extents2.len() {
-        return ExtentSharing::Distinct;
-    }
-    for (extent1, extent2) in extents1.iter().zip(extents2.iter()) {
-        // A location left unresolved, by a write landing after the flush, is a placeholder identical between
-        // unrelated files, so it can never establish sharing
-        if (extent1.fe_flags | extent2.fe_flags).intersects(UNRESOLVED_EXTENT_FLAGS)
-            || extent1.fe_physical != extent2.fe_physical
-            || extent1.fe_length != extent2.fe_length
-        {
-            return ExtentSharing::Distinct;
+/// Whether a file holds compressed data, whose offset within its extent the mapping leaves out
+fn is_encoded(extents: &[fiemap::FiemapExtent]) -> bool {
+    extents
+        .iter()
+        .any(|extent| extent.fe_flags.contains(fiemap::FiemapExtentFlags::ENCODED))
+}
+
+/// Identify the data a file maps to, `None` when its extents can not establish sharing
+///
+/// Files sharing a key hold the same bytes, save for compressed extents, which several contents can share. The
+/// logical offset is part of it, as the same extent mapped elsewhere in the file puts its bytes elsewhere too.
+fn extent_key(extents: &[fiemap::FiemapExtent]) -> Option<Vec<(u64, u64, u64)>> {
+    extents
+        .iter()
+        .map(|extent| {
+            (!extent.fe_flags.intersects(UNSHAREABLE_EXTENT_FLAGS)).then_some((
+                extent.fe_logical,
+                extent.fe_physical,
+                extent.fe_length,
+            ))
+        })
+        .collect()
+}
+
+/// One copy of a file content on disk, and the files already sharing it
+#[cfg_attr(test, derive(Debug, Eq, PartialEq))]
+struct DataCopy<'p> {
+    /// First file holding the copy, standing for all of them
+    path: &'p Path,
+    /// Whether the data sits in filesystem metadata, which reflinking can not share
+    inlined: bool,
+    /// Whether the data is compressed, which the extents alone can not tell apart from another content
+    encoded: bool,
+    /// Further files mapping to the extents of `path`, holding its data unless `encoded` leaves that to confirm
+    shared: Vec<&'p Path>,
+}
+
+/// Group files sharing a size and hash by the copy of the data they hold
+///
+/// Files mapping to the same extents hold the same bytes, so grouping them ahead of any content comparison spares
+/// reading data that is already shared. Compression is the exception, which `confirm_shared` settles for the files
+/// that end up reported.
+fn data_copies(filepaths: &[PathBuf]) -> Result<Vec<DataCopy<'_>>, io::Error> {
+    let mut copies: Vec<DataCopy<'_>> = Vec::new();
+    // Copies indexed by the data they hold, sparing a scan of them all for every file
+    let mut by_key: HashMap<Vec<(u64, u64, u64)>, usize> = HashMap::new();
+
+    for filepath in filepaths {
+        let path = filepath.as_path();
+        let extents = file_extents(filepath)?;
+        let copy = DataCopy {
+            path,
+            inlined: is_inlined(&extents),
+            encoded: is_encoded(&extents),
+            shared: Vec::new(),
+        };
+        let Some(key) = extent_key(&extents) else {
+            // Extents identifying nothing keep the file to itself, even against another file mapping the same way
+            copies.push(copy);
+            continue;
+        };
+        drop(extents);
+
+        // The index is inserted below from `copies.len()`, so it always resolves
+        #[expect(clippy::indexing_slicing)]
+        match by_key.entry(key) {
+            Entry::Occupied(known) => {
+                let known = &mut copies[*known.get()];
+                // A key carries no compression flag, so the copy takes that of every file joining it
+                known.encoded |= copy.encoded;
+                known.shared.push(path);
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(copies.len());
+                copies.push(copy);
+            }
         }
     }
-    ExtentSharing::Shared
+    Ok(copies)
+}
+
+/// Files sharing the extents of `other` that hold the content of `first`
+///
+/// A compressed extent is reported without the offset its data sits at, so files grouped on one can differ. The
+/// first file of a copy needs no confirming, the content classes having compared it.
+fn confirm_shared<'p>(first_path: &Path, other: &DataCopy<'p>) -> Result<Vec<&'p Path>, io::Error> {
+    if !other.encoded {
+        return Ok(other.shared.clone());
+    }
+    let mut confirmed = Vec::new();
+    for &path in &other.shared {
+        if same_content(first_path, path)? {
+            confirmed.push(path);
+        } else {
+            log::warn!(
+                "Files {first_path:?} and {path:?} share a compressed extent but hold different data"
+            );
+        }
+    }
+    Ok(confirmed)
+}
+
+/// Partition the copies of files sharing a size and hash into classes of identical content
+///
+/// Each class is its first copy, standing for the whole class, followed by the others. More than one class means
+/// the hash collided.
+fn content_classes<'c, 'p>(
+    copies: &'c [DataCopy<'p>],
+) -> Result<Vec<(&'c DataCopy<'p>, Vec<&'c DataCopy<'p>>)>, io::Error> {
+    let mut classes: Vec<(&DataCopy<'_>, Vec<&DataCopy<'_>>)> = Vec::new();
+    'copy: for copy in copies {
+        for (representative, others) in &mut classes {
+            // Content equality is transitive, so comparing against one member settles the whole class
+            if same_content(representative.path, copy.path)? {
+                others.push(copy);
+                continue 'copy;
+            }
+        }
+        classes.push((copy, Vec::new()));
+    }
+    Ok(classes)
 }
 
 /// Read a NUL terminated path into `buf`, stripping the terminator, `None` at end of input
@@ -311,6 +386,59 @@ where
     writer.write_all(b"\0")?;
     writer.write_all(second.as_os_str().as_bytes())?;
     writer.write_all(b"\0")
+}
+
+/// Report the duplicate pairs of every group of files sharing a size and hash
+///
+/// A pair names the file to reflink onto, then the one to replace, so the output feeds `cp --reflink` directly.
+fn report_duplicates<W>(
+    files: &HashMap<(u64, u64), Vec<PathBuf>>,
+    counters: &ProgressCounters,
+    writer: &mut W,
+) -> Result<(), io::Error>
+where
+    W: Write,
+{
+    for filepaths in files.values() {
+        let copies = data_copies(filepaths)?;
+        let classes = content_classes(&copies)?;
+        if classes.len() > 1 {
+            log::warn!(
+                "Files {filepaths:?} have the same size and hash but {count} distinct contents",
+                count = classes.len()
+            );
+            counters
+                .hash_collision
+                .fetch_add(classes.len() - 1, Ordering::Relaxed);
+        }
+
+        for (first, others) in classes {
+            let first_path = first.path;
+            for shared in &first.shared {
+                log::debug!("Files {first_path:?} and {shared:?} are already reflinked");
+                counters.reflinked.fetch_add(1, Ordering::Relaxed);
+            }
+            for other in others {
+                let other_path = other.path;
+                // Reflinking an inlined file onto one holding a regular extent releases that extent, so only a
+                // pair inlined on both sides has nothing to gain
+                if first.inlined && other.inlined {
+                    log::debug!(
+                        "Files {first_path:?} and {other_path:?} have inlined data, reflinking would not free space"
+                    );
+                    counters.inlined.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // Every file of the other copy needs its own reflink, sharing among them leaving the copy behind
+                for path in iter::once(other_path).chain(confirm_shared(first_path, other)?) {
+                    log::debug!("Files {first_path:?} and {path:?} are duplicates");
+                    counters.duplicate_candidate.fetch_add(1, Ordering::Relaxed);
+                    write_pair(writer, first_path, path)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read path metadata without following symlinks, warning when it can not be read
@@ -519,47 +647,7 @@ fn main() -> anyhow::Result<()> {
 
     // Find candidates
     let mut stdout = io::stdout().lock();
-    for filepaths in files.values() {
-        let classes = content_classes(filepaths)?;
-        if classes.len() > 1 {
-            log::warn!(
-                "Files {filepaths:?} have the same size and hash but {count} distinct contents",
-                count = classes.len()
-            );
-            progress_counters
-                .hash_collision
-                .fetch_add(classes.len() - 1, Ordering::Relaxed);
-        }
-
-        for (first, others) in classes {
-            // A class standing alone, left by a hash collision, has nothing to map its representative against
-            if others.is_empty() {
-                continue;
-            }
-            let first_extents = file_extents(first)?;
-            for other in others {
-                match compare_extents(&first_extents, &file_extents(other)?) {
-                    ExtentSharing::Shared => {
-                        log::debug!("Files {first:?} and {other:?} are already reflinked");
-                        progress_counters.reflinked.fetch_add(1, Ordering::Relaxed);
-                    }
-                    ExtentSharing::Inlined => {
-                        log::debug!(
-                            "Files {first:?} and {other:?} have inlined data, reflinking would not free space"
-                        );
-                        progress_counters.inlined.fetch_add(1, Ordering::Relaxed);
-                    }
-                    ExtentSharing::Distinct => {
-                        log::debug!("Files {first:?} and {other:?} are duplicates");
-                        progress_counters
-                            .duplicate_candidate
-                            .fetch_add(1, Ordering::Relaxed);
-                        write_pair(&mut stdout, first, other)?;
-                    }
-                }
-            }
-        }
-    }
+    report_duplicates(&files, &progress_counters, &mut stdout)?;
 
     progress.finish();
 
@@ -573,13 +661,42 @@ mod tests {
         process::{Command, Stdio},
     };
 
+    use linux_raw_sys::btrfs::{file_clone_range, FS_COMPR_FL};
+
     use super::*;
+
+    nix::ioctl_write_ptr!(
+        /// Clone a range of one file into another, as `cp --reflink` does for whole files
+        btrfs_clone_range,
+        0x94,
+        13,
+        file_clone_range
+    );
+
+    nix::ioctl_read!(
+        /// Read the inode flags of a file, as `lsattr` does
+        get_inode_flags,
+        b'f',
+        1,
+        nix::libc::c_long
+    );
+
+    nix::ioctl_write_ptr!(
+        /// Set the inode flags of a file, as `chattr` does
+        set_inode_flags,
+        b'f',
+        2,
+        nix::libc::c_long
+    );
 
     /// Size of a file small enough for Btrfs to store its data inline in metadata
     const INLINE_SIZE: usize = 500;
 
     /// Size of a file too large for Btrfs to store its data inline in metadata
     const EXTENT_SIZE: usize = 300 * 1024;
+
+    /// Length of a cloned range, the largest Btrfs sector size a clone has to align to
+    const CLONE_RANGE_SIZE: u64 = 64 * 1024;
 
     /// Temporary directory under the build directory, `None` when it is not on a Btrfs filesystem
     ///
@@ -615,6 +732,40 @@ mod tests {
             .collect()
     }
 
+    /// Write a file of `size` bytes Btrfs stores compressed, whatever the mount options
+    ///
+    /// Every block holds distinct bytes, so that two ranges of the extent read differently.
+    fn write_compressed(path: &Path, size: usize) {
+        let file = File::create(path).unwrap();
+        let mut flags: nix::libc::c_long = 0;
+        // SAFETY: the ioctl writes one c_long to flags
+        unsafe { get_inode_flags(file.as_raw_fd(), &raw mut flags) }.unwrap();
+        flags |= nix::libc::c_long::from(FS_COMPR_FL);
+        // SAFETY: the ioctl reads one c_long from flags
+        unsafe { set_inode_flags(file.as_raw_fd(), &raw const flags) }.unwrap();
+
+        let data: Vec<u8> = (0..size)
+            .map(|offset| u8::try_from((offset / 4096) % 256).unwrap())
+            .collect();
+        fs::write(path, data).unwrap();
+        File::open(path).unwrap().sync_data().unwrap();
+    }
+
+    /// Clone `length` bytes of `source` at `offset` into a new file at `path`
+    fn clone_range(source: &Path, offset: u64, length: u64, path: &Path) {
+        let source_file = File::open(source).unwrap();
+        let file = File::create(path).unwrap();
+        let args = file_clone_range {
+            src_fd: source_file.as_raw_fd().into(),
+            src_offset: offset,
+            src_length: length,
+            dest_offset: 0,
+        };
+        // SAFETY: the ioctl reads `size_of::<file_clone_range>()` bytes from `args`
+        unsafe { btrfs_clone_range(file.as_raw_fd(), &raw const args) }.unwrap();
+        file.sync_data().unwrap();
+    }
+
     /// Write a file of `size` bytes, leaving its data under delayed allocation
     fn write_unflushed(path: &Path, size: usize) {
         fs::write(path, incompressible_bytes(size)).unwrap();
@@ -626,12 +777,33 @@ mod tests {
         File::open(path).unwrap().sync_data().unwrap();
     }
 
-    /// Map both files and compare them, as the candidate reporting does
-    fn compare_files(first: &Path, second: &Path) -> ExtentSharing {
-        compare_extents(
-            &file_extents(first).unwrap(),
-            &file_extents(second).unwrap(),
-        )
+    /// Build the pair of paths a two file test writes to
+    fn pair_paths(dir: &Path) -> (PathBuf, PathBuf) {
+        (dir.join("first"), dir.join("second"))
+    }
+
+    /// Map both files and test whether they already share their data, as the candidate reporting does
+    fn files_share_extents(first: &Path, second: &Path) -> bool {
+        let key = extent_key(&file_extents(first).unwrap());
+        key.is_some() && key == extent_key(&file_extents(second).unwrap())
+    }
+
+    /// Build an unencoded, extent backed copy holding the given files
+    fn plain_copy<'p>(path: &'p Path, shared: Vec<&'p Path>) -> DataCopy<'p> {
+        DataCopy {
+            path,
+            inlined: false,
+            encoded: false,
+            shared,
+        }
+    }
+
+    /// Build one copy per path, holding a single file, as a tree with no sharing would produce
+    fn unshared_copies(paths: &[PathBuf]) -> Vec<DataCopy<'_>> {
+        paths
+            .iter()
+            .map(|path| plain_copy(path, Vec::new()))
+            .collect()
     }
 
     /// Map a file without flushing it, leaving delayed allocation unresolved
@@ -645,8 +817,7 @@ mod tests {
     /// Write two files and compare their content, as the candidate reporting does
     fn compare_content(first_content: &[u8], second_content: &[u8]) -> bool {
         let dir = tempfile::TempDir::new().unwrap();
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
+        let (first, second) = pair_paths(dir.path());
         fs::write(&first, first_content).unwrap();
         fs::write(&second, second_content).unwrap();
 
@@ -707,13 +878,11 @@ mod tests {
     fn content_classes_identical_files_form_one_class() {
         let dir = tempfile::TempDir::new().unwrap();
         let paths = write_group(dir.path(), &[b"dup", b"dup", b"dup"]);
+        let copies = unshared_copies(&paths);
 
         assert_eq!(
-            content_classes(&paths).unwrap(),
-            vec![(
-                paths[0].as_path(),
-                vec![paths[1].as_path(), paths[2].as_path()]
-            )]
+            content_classes(&copies).unwrap(),
+            vec![(&copies[0], vec![&copies[1], &copies[2]])]
         );
     }
 
@@ -722,28 +891,303 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         // The first file colliding with the rest is what hides the duplicates behind it
         let paths = write_group(dir.path(), &[b"odd", b"dup", b"dup"]);
+        let copies = unshared_copies(&paths);
 
         assert_eq!(
-            content_classes(&paths).unwrap(),
-            vec![
-                (paths[0].as_path(), vec![]),
-                (paths[1].as_path(), vec![paths[2].as_path()]),
-            ]
+            content_classes(&copies).unwrap(),
+            vec![(&copies[0], vec![]), (&copies[1], vec![&copies[2]]),]
         );
     }
 
     #[test]
-    fn content_classes_all_distinct_files_are_singletons() {
+    fn content_classes_compares_one_file_per_copy() {
         let dir = tempfile::TempDir::new().unwrap();
-        let paths = write_group(dir.path(), &[b"aaa", b"bbb", b"ccc"]);
+        let paths = write_group(dir.path(), &[b"dup", b"dup"]);
+        // A file already sharing its data is never read, so a path that can not be opened stands in for one
+        let missing = dir.path().join("missing");
+        let copies = vec![
+            plain_copy(&paths[0], vec![missing.as_path()]),
+            plain_copy(&paths[1], vec![]),
+        ];
 
         assert_eq!(
-            content_classes(&paths).unwrap(),
+            content_classes(&copies).unwrap(),
+            vec![(&copies[0], vec![&copies[1]])]
+        );
+    }
+
+    #[test]
+    fn data_copies_reflinked_files_form_one_copy() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        let paths = vec![first.clone(), second.clone()];
+
+        assert_eq!(
+            data_copies(&paths).unwrap(),
+            vec![plain_copy(&first, vec![second.as_path()])]
+        );
+    }
+
+    #[test]
+    fn data_copies_indexes_interleaved_reflink_sets() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        let first_shared = dir.path().join("first-shared");
+        let second_shared = dir.path().join("second-shared");
+        write_flushed(&first, EXTENT_SIZE);
+        write_flushed(&second, EXTENT_SIZE);
+        fs::copy(&first, &first_shared).unwrap();
+        fs::copy(&second, &second_shared).unwrap();
+        // Interleaving two sets of reflinks leaves the second copy behind the first in the index
+        let paths = vec![
+            first.clone(),
+            second.clone(),
+            first_shared.clone(),
+            second_shared.clone(),
+        ];
+
+        assert_eq!(
+            data_copies(&paths).unwrap(),
             vec![
-                (paths[0].as_path(), vec![]),
-                (paths[1].as_path(), vec![]),
-                (paths[2].as_path(), vec![]),
+                plain_copy(&first, vec![first_shared.as_path()]),
+                plain_copy(&second, vec![second_shared.as_path()]),
             ]
+        );
+    }
+
+    /// Clone two differing ranges of one compressed extent, which Btrfs maps identically, into a pair of files
+    fn clone_compressed_ranges(dir: &Path) -> (PathBuf, PathBuf) {
+        let (first, second) = pair_paths(dir);
+        let base = dir.join("base");
+        write_compressed(&base, EXTENT_SIZE);
+        // Btrfs compresses in 128 KiB units, so both ranges fall inside one extent
+        clone_range(&base, 0, CLONE_RANGE_SIZE, &first);
+        clone_range(&base, CLONE_RANGE_SIZE, CLONE_RANGE_SIZE, &second);
+
+        let first_extents = file_extents(&first).unwrap();
+        assert!(is_encoded(&first_extents));
+        assert_eq!(
+            extent_key(&first_extents),
+            extent_key(&file_extents(&second).unwrap())
+        );
+        assert_ne!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        (first, second)
+    }
+
+    #[test]
+    fn data_copies_ranges_of_one_compressed_extent_form_one_copy() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = clone_compressed_ranges(dir.path());
+        let paths = vec![first.clone(), second.clone()];
+
+        // A compressed extent is reported without the offset its data sits at, so the extents group the files
+        // although they differ, leaving them for confirm_shared to tell apart
+        assert_eq!(
+            data_copies(&paths).unwrap(),
+            vec![DataCopy {
+                encoded: true,
+                ..plain_copy(&first, vec![second.as_path()])
+            }]
+        );
+    }
+
+    #[test]
+    fn confirm_shared_does_not_read_unencoded_members() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (first, second) = pair_paths(dir.path());
+        fs::write(&first, b"dup").unwrap();
+        fs::write(&second, b"dup").unwrap();
+        // Extents settle sharing on their own unless compressed, so a path that can not be opened stands in for a
+        // file taken on its extents alone
+        let missing = dir.path().join("missing");
+        let other = DataCopy {
+            path: &second,
+            inlined: false,
+            encoded: false,
+            shared: vec![missing.as_path()],
+        };
+
+        assert_eq!(
+            confirm_shared(&first, &other).unwrap(),
+            vec![missing.as_path()]
+        );
+    }
+
+    #[test]
+    fn data_copies_inlined_files_stand_apart() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, INLINE_SIZE);
+        // Btrfs copies inline data into the destination instead of sharing it
+        fs::copy(&first, &second).unwrap();
+        let paths = vec![first.clone(), second.clone()];
+
+        assert_eq!(
+            data_copies(&paths).unwrap(),
+            vec![
+                DataCopy {
+                    inlined: true,
+                    ..plain_copy(&first, vec![])
+                },
+                DataCopy {
+                    inlined: true,
+                    ..plain_copy(&second, vec![])
+                },
+            ]
+        );
+    }
+
+    /// Report the duplicates of one group of files sharing a size and hash, decoding the pairs written
+    fn reported_pairs(group: Vec<PathBuf>, counters: &ProgressCounters) -> Vec<(PathBuf, PathBuf)> {
+        let mut out = Vec::new();
+        // The size and hash are what grouped the files, which the reporting never reads back
+        report_duplicates(&HashMap::from([((0, 0), group)]), counters, &mut out).unwrap();
+
+        out.split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn report_duplicates_reports_independently_allocated_files() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        write_flushed(&second, EXTENT_SIZE);
+
+        assert_eq!(
+            reported_pairs(
+                vec![first.clone(), second.clone()],
+                &ProgressCounters::default()
+            ),
+            vec![(first, second)]
+        );
+    }
+
+    #[test]
+    fn report_duplicates_counts_reflinked_files_instead_of_reporting_them() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        let counters = ProgressCounters::default();
+
+        assert_eq!(reported_pairs(vec![first, second], &counters), vec![]);
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 0 hash collisions, 1 already reflinked, 0 inlined, 0 duplicates"
+        );
+    }
+
+    #[test]
+    fn report_duplicates_counts_inlined_pairs_instead_of_reporting_them() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, INLINE_SIZE);
+        write_flushed(&second, INLINE_SIZE);
+        let counters = ProgressCounters::default();
+
+        assert_eq!(reported_pairs(vec![first, second], &counters), vec![]);
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 0 hash collisions, 0 already reflinked, 1 inlined, 0 duplicates"
+        );
+    }
+
+    #[test]
+    fn report_duplicates_reports_an_inlined_file_against_an_extent() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let inlined = dir.path().join("inlined");
+        let truncated = dir.path().join("truncated");
+        write_flushed(&inlined, INLINE_SIZE);
+        // Truncating below the inline threshold keeps the allocated extent, so the pair holds one of each, and
+        // reflinking releases that extent
+        write_flushed(&truncated, EXTENT_SIZE);
+        let file = File::options().write(true).open(&truncated).unwrap();
+        file.set_len(INLINE_SIZE as u64).unwrap();
+        file.sync_data().unwrap();
+
+        assert_eq!(
+            reported_pairs(
+                vec![inlined.clone(), truncated.clone()],
+                &ProgressCounters::default()
+            ),
+            vec![(inlined, truncated)]
+        );
+    }
+
+    #[test]
+    fn report_duplicates_reports_every_file_of_a_shared_copy() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        let shared = dir.path().join("shared");
+        write_flushed(&first, EXTENT_SIZE);
+        write_flushed(&second, EXTENT_SIZE);
+        fs::copy(&second, &shared).unwrap();
+
+        // Reflinking second onto first leaves shared holding the copy second stood for, so it needs its own pair
+        assert_eq!(
+            reported_pairs(
+                vec![first.clone(), second.clone(), shared.clone()],
+                &ProgressCounters::default()
+            ),
+            vec![(first.clone(), second), (first, shared)]
+        );
+    }
+
+    #[test]
+    fn report_duplicates_confirms_each_member_of_a_compressed_copy() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (same, different) = clone_compressed_ranges(dir.path());
+        let same_shared = dir.path().join("same-shared");
+        fs::copy(&same, &same_shared).unwrap();
+        assert!(files_share_extents(&same, &same_shared));
+        // An independent file leads the class, so the compressed copy is the one whose members get confirmed
+        let independent = dir.path().join("independent");
+        fs::write(&independent, fs::read(&same).unwrap()).unwrap();
+        File::open(&independent).unwrap().sync_data().unwrap();
+
+        // The differing range comes first among the shared files, so confirming has to look past it
+        assert_eq!(
+            reported_pairs(
+                vec![
+                    independent.clone(),
+                    same.clone(),
+                    different,
+                    same_shared.clone()
+                ],
+                &ProgressCounters::default()
+            ),
+            vec![(independent.clone(), same), (independent, same_shared)]
+        );
+    }
+
+    #[test]
+    fn report_duplicates_counts_collision_and_reports_later_class() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let duplicate = incompressible_bytes(EXTENT_SIZE);
+        let mut odd = duplicate.clone();
+        *odd.first_mut().unwrap() ^= 0xff;
+        let mut odder = duplicate.clone();
+        *odder.last_mut().unwrap() ^= 0xff;
+        // The colliding files lead, so reporting has to carry on past the classes they form alone, and a third
+        // content makes the count differ from the number of collided groups
+        let paths = write_group(dir.path(), &[&odd, &odder, &duplicate, &duplicate]);
+        let counters = ProgressCounters::default();
+
+        assert_eq!(
+            reported_pairs(paths.clone(), &counters),
+            vec![(paths[2].clone(), paths[3].clone())]
+        );
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 2 hash collisions, 0 already reflinked, 0 inlined, 1 duplicates"
         );
     }
 
@@ -807,46 +1251,9 @@ mod tests {
     }
 
     #[test]
-    fn compare_extents_reflinked_is_shared() {
+    fn files_share_extents_not_partially_rewritten_reflink() {
         let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        write_flushed(&first, EXTENT_SIZE);
-        // On Btrfs a plain copy is reflinked, sharing the extents of the source
-        fs::copy(&first, &second).unwrap();
-
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Shared);
-    }
-
-    #[test]
-    fn compare_extents_independently_written_is_distinct() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        write_flushed(&first, EXTENT_SIZE);
-        write_flushed(&second, EXTENT_SIZE);
-
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Distinct);
-    }
-
-    #[test]
-    fn compare_extents_unflushed_is_distinct() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        write_unflushed(&first, EXTENT_SIZE);
-        write_unflushed(&second, EXTENT_SIZE);
-
-        // Both files map to a placeholder extent until their delayed allocation is resolved, which would make
-        // them compare as shared
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Distinct);
-    }
-
-    #[test]
-    fn compare_extents_partially_rewritten_reflink_is_distinct() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
+        let (first, second) = pair_paths(dir.path());
         write_flushed(&first, EXTENT_SIZE);
         fs::copy(&first, &second).unwrap();
         // Rewriting identical bytes breaks sharing for that range, leaving the files identical but no longer
@@ -856,11 +1263,11 @@ mod tests {
             .unwrap();
         file.sync_data().unwrap();
 
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Distinct);
+        assert!(!files_share_extents(&first, &second));
     }
 
     #[test]
-    fn compare_extents_sparse_and_dense_are_distinct() {
+    fn files_share_extents_not_sparse_and_dense() {
         let Some(dir) = btrfs_test_dir() else { return };
         let sparse = dir.path().join("sparse");
         let dense = dir.path().join("dense");
@@ -879,46 +1286,26 @@ mod tests {
         dense_file.write_all(&tail).unwrap();
         dense_file.sync_data().unwrap();
 
-        assert_eq!(compare_files(&sparse, &dense), ExtentSharing::Distinct);
+        assert!(!files_share_extents(&sparse, &dense));
     }
 
     #[test]
-    fn compare_extents_independently_written_small_is_inlined() {
+    fn extent_key_includes_logical_offset() {
         let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        write_flushed(&first, INLINE_SIZE);
-        write_flushed(&second, INLINE_SIZE);
+        let path = dir.path().join("file");
+        write_flushed(&path, EXTENT_SIZE);
 
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Inlined);
+        // Only a synthesized map can hold the same extent at another offset, which a hole opening ahead of the
+        // data would produce while changing the bytes the file reads as
+        let extents = file_extents(&path).unwrap();
+        let mut shifted = extents.clone();
+        shifted[0].fe_logical += EXTENT_SIZE as u64;
+
+        assert_ne!(extent_key(&shifted), extent_key(&extents));
     }
 
     #[test]
-    fn compare_extents_reflinked_small_is_inlined() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        write_flushed(&first, INLINE_SIZE);
-        // Btrfs copies inline data into the destination instead of sharing it
-        fs::copy(&first, &second).unwrap();
-
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Inlined);
-    }
-
-    #[test]
-    fn compare_extents_unflushed_small_is_inlined() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        write_unflushed(&first, INLINE_SIZE);
-        write_unflushed(&second, INLINE_SIZE);
-
-        // Delayed allocation hides that the data will be inlined, which would report the pair as a candidate
-        assert_eq!(compare_files(&first, &second), ExtentSharing::Inlined);
-    }
-
-    #[test]
-    fn compare_extents_same_size_inline_and_extent_is_distinct() {
+    fn extent_key_none_for_inlined_data() {
         let Some(dir) = btrfs_test_dir() else { return };
         let inlined = dir.path().join("inlined");
         let truncated = dir.path().join("truncated");
@@ -936,18 +1323,12 @@ mod tests {
         assert!(!is_inlined(&truncated_extents));
 
         // Reflinking the inlined file onto the other releases the extent it holds alone
-        assert_eq!(
-            compare_extents(&inlined_extents, &truncated_extents),
-            ExtentSharing::Distinct
-        );
-        assert_eq!(
-            compare_extents(&truncated_extents, &inlined_extents),
-            ExtentSharing::Distinct
-        );
+        assert!(extent_key(&inlined_extents).is_none());
+        assert_ne!(extent_key(&inlined_extents), extent_key(&truncated_extents));
     }
 
     #[test]
-    fn compare_extents_partially_shared_extent_is_distinct() {
+    fn extent_key_includes_extent_length() {
         let Some(dir) = btrfs_test_dir() else { return };
         let whole = dir.path().join("whole");
         let part = dir.path().join("part");
@@ -964,14 +1345,11 @@ mod tests {
         assert_eq!(whole_extents[0].fe_physical, part_extents[0].fe_physical);
         assert_ne!(whole_extents[0].fe_length, part_extents[0].fe_length);
 
-        assert_eq!(
-            compare_extents(&whole_extents, &part_extents),
-            ExtentSharing::Distinct
-        );
+        assert_ne!(extent_key(&whole_extents), extent_key(&part_extents));
     }
 
     #[test]
-    fn compare_extents_prefix_map_is_distinct() {
+    fn extent_key_includes_entire_map() {
         let Some(dir) = btrfs_test_dir() else { return };
         let path = dir.path().join("file");
         write_flushed(&path, EXTENT_SIZE);
@@ -984,17 +1362,13 @@ mod tests {
         assert!(extents.len() > 1);
 
         // Every extent of the shorter map is shared, yet the files are not
-        assert_eq!(
-            compare_extents(&extents[..1], &extents),
-            ExtentSharing::Distinct
-        );
+        assert_ne!(extent_key(&extents[..1]), extent_key(&extents));
     }
 
     #[test]
-    fn compare_extents_unresolved_locations_are_distinct() {
+    fn extent_key_none_for_unresolved_locations() {
         let Some(dir) = btrfs_test_dir() else { return };
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
+        let (first, second) = pair_paths(dir.path());
         write_unflushed(&first, EXTENT_SIZE);
         write_unflushed(&second, EXTENT_SIZE);
 
@@ -1007,31 +1381,9 @@ mod tests {
             .chain(extents2.iter())
             .all(|extent| extent.fe_flags.intersects(UNRESOLVED_EXTENT_FLAGS)));
 
-        assert_eq!(
-            compare_extents(&extents1, &extents2),
-            ExtentSharing::Distinct
-        );
-    }
-
-    #[test]
-    fn compare_extents_one_sided_unresolved_location_is_distinct() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let path = dir.path().join("file");
-        write_flushed(&path, EXTENT_SIZE);
-
-        // Only a synthesized map can hold an unresolved location while matching an allocated one everywhere else
-        let extents = file_extents(&path).unwrap();
-        let mut unresolved = extents.clone();
-        unresolved[0].fe_flags.insert(UNRESOLVED_EXTENT_FLAGS);
-
-        assert_eq!(
-            compare_extents(&unresolved, &extents),
-            ExtentSharing::Distinct
-        );
-        assert_eq!(
-            compare_extents(&extents, &unresolved),
-            ExtentSharing::Distinct
-        );
+        // Both map the same way, so a key would group them
+        assert!(extent_key(&extents1).is_none());
+        assert!(extent_key(&extents2).is_none());
     }
 
     #[test]
