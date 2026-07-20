@@ -532,8 +532,13 @@ fn main() -> anyhow::Result<()> {
         }
 
         for (first, others) in classes {
+            // A class standing alone, left by a hash collision, has nothing to map its representative against
+            if others.is_empty() {
+                continue;
+            }
+            let first_extents = file_extents(first)?;
             for other in others {
-                match compare_extents(&file_extents(first)?, &file_extents(other)?) {
+                match compare_extents(&first_extents, &file_extents(other)?) {
                     ExtentSharing::Shared => {
                         log::debug!("Files {first:?} and {other:?} are already reflinked");
                         progress_counters.reflinked.fetch_add(1, Ordering::Relaxed);
