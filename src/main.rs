@@ -24,7 +24,6 @@ use std::{
 use anyhow::Context as _;
 use clap::Parser;
 use linux_raw_sys::btrfs::btrfs_ioctl_fs_info_args;
-use multimap::MultiMap;
 use xxhash_rust::xxh3;
 
 /// File read chunk size, in bytes
@@ -356,7 +355,7 @@ fn main() -> anyhow::Result<()> {
         crossbeam_channel::unbounded();
 
     // File hash map
-    let mut files: MultiMap<(u64, u64), PathBuf> = MultiMap::new();
+    let mut files: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
 
     // Progress
     let progress = indicatif::ProgressBar::new_spinner();
@@ -490,7 +489,7 @@ fn main() -> anyhow::Result<()> {
 
         // Fill hashmap
         for (filepath, file_size, hash) in &hashed_rx {
-            files.insert((file_size, hash), filepath);
+            files.entry((file_size, hash)).or_default().push(filepath);
         }
 
         // Workers have all completed once their channel ends were dropped above, so this does not block
@@ -502,18 +501,11 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     // Remove unique hashes
-    for key in files
-        .keys()
-        .filter(|k| !files.is_vec(k))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>()
-    {
-        files.remove(&key);
-    }
+    files.retain(|_key, filepaths| filepaths.len() > 1);
 
     // Find candidates
     let mut stdout = io::stdout().lock();
-    for ((_file_size, _file_hash), filepaths) in files.iter_all() {
+    for filepaths in files.values() {
         let classes = content_classes(filepaths)?;
         if classes.len() > 1 {
             log::warn!(
