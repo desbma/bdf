@@ -326,6 +326,28 @@ fn wanted_file_size(file_size: u64, min_size: Option<u64>) -> Option<u64> {
     (file_size != 0 && min_size.is_none_or(|minimum| file_size >= minimum)).then_some(file_size)
 }
 
+/// Tracks the sizes seen so far, withholding the first file of each until a second file of that size shows up
+///
+/// Identical files have identical sizes, so a file whose size no other file shares can not have a duplicate, and
+/// hashing it would read it in full for nothing.
+#[derive(Default)]
+struct SizeTracker(HashMap<u64, Option<PathBuf>>);
+
+impl SizeTracker {
+    /// Take in a file, returning the files whose size is now known to be shared, and which are therefore worth
+    /// hashing: none while the size is unique so far, both the withheld file and this one when it completes a first
+    /// pair, this one alone afterwards
+    fn track(&mut self, path: PathBuf, file_size: u64) -> [Option<PathBuf>; 2] {
+        match self.0.entry(file_size) {
+            Entry::Vacant(e) => {
+                e.insert(Some(path));
+                [None, None]
+            }
+            Entry::Occupied(mut e) => [e.get_mut().take(), Some(path)],
+        }
+    }
+}
+
 #[expect(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     // Init logger
@@ -390,7 +412,7 @@ fn main() -> anyhow::Result<()> {
         drop(hashed_tx);
 
         // Iterate over files
-        let mut entry_map: HashMap<u64, Option<walkdir::DirEntry>> = HashMap::new();
+        let mut size_tracker = SizeTracker::default();
         if let Some(dir_walk) = dir_walk {
             for entry in dir_walk {
                 let entry = match entry {
@@ -414,21 +436,9 @@ fn main() -> anyhow::Result<()> {
                 progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
 
-                // Decide what to to depending on whether or not we have already seen some files for this size
-                // This allows saving some hash computations for the common case
-                match entry_map.entry(file_size) {
-                    Entry::Vacant(e) => {
-                        // First file for this size, keep entry and move along
-                        e.insert(Some(entry));
-                    }
-                    Entry::Occupied(mut e) => {
-                        // The first file of a size is held back until a second one shows up, so it is only hashed
-                        // once it can have a duplicate
-                        if let Some(prev_entry) = e.get_mut().take() {
-                            to_hashed_tx.send((prev_entry.path().to_path_buf(), file_size))?;
-                        }
-                        to_hashed_tx.send((path.to_path_buf(), file_size))?;
-                    }
+                let tracked = size_tracker.track(path.to_path_buf(), file_size);
+                for to_hash in tracked.into_iter().flatten() {
+                    to_hashed_tx.send((to_hash, file_size))?;
                 }
             }
         } else {
@@ -475,7 +485,10 @@ fn main() -> anyhow::Result<()> {
                 progress_counters.file.fetch_add(1, Ordering::AcqRel);
                 progress.set_message(format!("{progress_counters}"));
 
-                to_hashed_tx.send((path.to_path_buf(), file_size))?;
+                let tracked = size_tracker.track(path.to_path_buf(), file_size);
+                for to_hash in tracked.into_iter().flatten() {
+                    to_hashed_tx.send((to_hash, file_size))?;
+                }
             }
         }
         drop(to_hashed_tx);
@@ -720,6 +733,49 @@ mod tests {
                 (paths[1].as_path(), vec![]),
                 (paths[2].as_path(), vec![]),
             ]
+        );
+    }
+
+    #[test]
+    fn size_tracker_withholds_a_size_seen_once() {
+        let mut size_tracker = SizeTracker::default();
+
+        assert_eq!(size_tracker.track(PathBuf::from("a"), 1), [None, None]);
+        assert_eq!(size_tracker.track(PathBuf::from("b"), 2), [None, None]);
+    }
+
+    #[test]
+    fn size_tracker_releases_both_files_completing_a_pair() {
+        let mut size_tracker = SizeTracker::default();
+        size_tracker.track(PathBuf::from("a"), 1);
+
+        assert_eq!(
+            size_tracker.track(PathBuf::from("b"), 1),
+            [Some(PathBuf::from("a")), Some(PathBuf::from("b"))]
+        );
+    }
+
+    #[test]
+    fn size_tracker_releases_only_the_new_file_of_an_already_shared_size() {
+        let mut size_tracker = SizeTracker::default();
+        size_tracker.track(PathBuf::from("a"), 1);
+        size_tracker.track(PathBuf::from("b"), 1);
+
+        assert_eq!(
+            size_tracker.track(PathBuf::from("c"), 1),
+            [None, Some(PathBuf::from("c"))]
+        );
+    }
+
+    #[test]
+    fn size_tracker_keeps_sizes_independent() {
+        let mut size_tracker = SizeTracker::default();
+        size_tracker.track(PathBuf::from("a"), 1);
+        size_tracker.track(PathBuf::from("b"), 2);
+
+        assert_eq!(
+            size_tracker.track(PathBuf::from("c"), 2),
+            [Some(PathBuf::from("b")), Some(PathBuf::from("c"))]
         );
     }
 
