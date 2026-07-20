@@ -373,9 +373,21 @@ fn main() -> anyhow::Result<()> {
     let mut files: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
 
     // Progress
-    let progress = indicatif::ProgressBar::new_spinner();
-    progress.enable_steady_tick(Duration::from_millis(300));
     let progress_counters = Arc::new(ProgressCounters::default());
+    let progress = indicatif::ProgressBar::new_spinner().with_style(
+        indicatif::ProgressStyle::with_template("{spinner} {counters}")
+            .context("Invalid progress template")?
+            .with_key("counters", {
+                let progress_counters = Arc::clone(&progress_counters);
+                // Rendering the counters when a frame is drawn, rather than when they change, keeps formatting and
+                // its allocation off the per file path
+                move |_: &indicatif::ProgressState, writer: &mut dyn fmt::Write| {
+                    // The writer collects into a string, and the style has no way to report a failure anyway
+                    let _ = write!(writer, "{progress_counters}");
+                }
+            }),
+    );
+    progress.enable_steady_tick(Duration::from_millis(300));
 
     thread::scope(|scope| -> anyhow::Result<()> {
         // Worker threads
@@ -385,7 +397,6 @@ fn main() -> anyhow::Result<()> {
             // Per thread clones
             let to_hashed_rx = to_hashed_rx.clone();
             let hashed_tx = hashed_tx.clone();
-            let progress = progress.clone();
             let progress_counters = Arc::clone(&progress_counters);
 
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
@@ -399,8 +410,7 @@ fn main() -> anyhow::Result<()> {
                     };
 
                     log::debug!("{path:?} {hash:016x}");
-                    progress_counters.hash.fetch_add(1, Ordering::AcqRel);
-                    progress.set_message(format!("{progress_counters}"));
+                    progress_counters.hash.fetch_add(1, Ordering::Relaxed);
 
                     hashed_tx.send((path, file_size, hash))?;
                 }
@@ -433,8 +443,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 let path = entry.path();
                 log::debug!("{path:?}");
-                progress_counters.file.fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{progress_counters}"));
+                progress_counters.file.fetch_add(1, Ordering::Relaxed);
 
                 let tracked = size_tracker.track(path.to_path_buf(), file_size);
                 for to_hash in tracked.into_iter().flatten() {
@@ -482,8 +491,7 @@ fn main() -> anyhow::Result<()> {
                     continue;
                 };
                 log::debug!("{path:?}");
-                progress_counters.file.fetch_add(1, Ordering::AcqRel);
-                progress.set_message(format!("{progress_counters}"));
+                progress_counters.file.fetch_add(1, Ordering::Relaxed);
 
                 let tracked = size_tracker.track(path.to_path_buf(), file_size);
                 for to_hash in tracked.into_iter().flatten() {
@@ -520,8 +528,7 @@ fn main() -> anyhow::Result<()> {
             );
             progress_counters
                 .hash_collision
-                .fetch_add(classes.len() - 1, Ordering::AcqRel);
-            progress.set_message(format!("{progress_counters}"));
+                .fetch_add(classes.len() - 1, Ordering::Relaxed);
         }
 
         for (first, others) in classes {
@@ -529,23 +536,22 @@ fn main() -> anyhow::Result<()> {
                 match compare_extents(&file_extents(first)?, &file_extents(other)?) {
                     ExtentSharing::Shared => {
                         log::debug!("Files {first:?} and {other:?} are already reflinked");
-                        progress_counters.reflinked.fetch_add(1, Ordering::AcqRel);
+                        progress_counters.reflinked.fetch_add(1, Ordering::Relaxed);
                     }
                     ExtentSharing::Inlined => {
                         log::debug!(
                             "Files {first:?} and {other:?} have inlined data, reflinking would not free space"
                         );
-                        progress_counters.inlined.fetch_add(1, Ordering::AcqRel);
+                        progress_counters.inlined.fetch_add(1, Ordering::Relaxed);
                     }
                     ExtentSharing::Distinct => {
                         log::debug!("Files {first:?} and {other:?} are duplicates");
                         progress_counters
                             .duplicate_candidate
-                            .fetch_add(1, Ordering::AcqRel);
+                            .fetch_add(1, Ordering::Relaxed);
                         write_pair(&mut stdout, first, other)?;
                     }
                 }
-                progress.set_message(format!("{progress_counters}"));
             }
         }
     }
@@ -733,6 +739,22 @@ mod tests {
                 (paths[1].as_path(), vec![]),
                 (paths[2].as_path(), vec![]),
             ]
+        );
+    }
+
+    #[test]
+    fn progress_counters_display_reports_every_counter() {
+        let counters = ProgressCounters::default();
+        counters.file.fetch_add(6, Ordering::Relaxed);
+        counters.hash.fetch_add(5, Ordering::Relaxed);
+        counters.hash_collision.fetch_add(4, Ordering::Relaxed);
+        counters.reflinked.fetch_add(3, Ordering::Relaxed);
+        counters.inlined.fetch_add(2, Ordering::Relaxed);
+        counters.duplicate_candidate.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(
+            counters.to_string(),
+            "6 files, 5 hashes, 4 hash collisions, 3 already reflinked, 2 inlined, 1 duplicates"
         );
     }
 
