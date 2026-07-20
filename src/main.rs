@@ -6,7 +6,7 @@ use std::{
     ffi::OsStr,
     fmt,
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read as _, Write},
+    io::{self, BufRead, Read as _, Write},
     mem::zeroed,
     os::{
         fd::AsRawFd as _,
@@ -138,15 +138,12 @@ pub struct CommandLineOpts {
 
 /// Compute an XXH3-64 non-cryptographic file hash
 fn hash_file(path: &Path, hasher: &mut xxh3::Xxh3, buffer: &mut Vec<u8>) -> Result<u64, io::Error> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let file = File::open(path)?;
     hasher.reset();
     loop {
         // Unlike a bare read, read_to_end fills the whole chunk, resuming when a signal interrupts it
         buffer.clear();
-        reader
-            .by_ref()
-            .take(READ_BUFFER_SIZE as u64)
-            .read_to_end(buffer)?;
+        (&file).take(READ_BUFFER_SIZE as u64).read_to_end(buffer)?;
         if buffer.is_empty() {
             break;
         }
@@ -194,23 +191,19 @@ fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
     let file1 = File::open(first)?;
     let file2 = File::open(second)?;
     debug_assert_eq!(file1.metadata()?.len(), file2.metadata()?.len());
-    let mut reader1 = BufReader::new(file1);
-    let mut reader2 = BufReader::new(file2);
     let mut buffer1 = Vec::with_capacity(READ_BUFFER_SIZE);
     let mut buffer2 = Vec::with_capacity(READ_BUFFER_SIZE);
     loop {
         // Unlike a bare read, read_to_end fills the whole chunk, resuming when a signal interrupts it
         buffer1.clear();
-        reader1
-            .by_ref()
+        (&file1)
             .take(READ_BUFFER_SIZE as u64)
             .read_to_end(&mut buffer1)?;
         if buffer1.is_empty() {
             break;
         }
         buffer2.clear();
-        reader2
-            .by_ref()
+        (&file2)
             .take(READ_BUFFER_SIZE as u64)
             .read_to_end(&mut buffer2)?;
         if buffer1 != buffer2 {
