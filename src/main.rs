@@ -47,6 +47,9 @@ type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Rec
 /// Identifier of a Btrfs filesystem, the same for all of its subvolumes
 type BtrfsFsid = [u8; 16];
 
+/// Offset of one extent in the file, its location on the device, and its length
+type ExtentLocation = (u64, u64, u64);
+
 nix::ioctl_read!(
     /// Query the Btrfs filesystem holding an open file
     btrfs_fs_info,
@@ -249,7 +252,7 @@ fn is_encoded(extents: &[fiemap::FiemapExtent]) -> bool {
 ///
 /// Files sharing a key hold the same bytes, save for compressed extents, which several contents can share. The
 /// logical offset is part of it, as the same extent mapped elsewhere in the file puts its bytes elsewhere too.
-fn extent_key(extents: &[fiemap::FiemapExtent]) -> Option<Vec<(u64, u64, u64)>> {
+fn extent_key(extents: &[fiemap::FiemapExtent]) -> Option<Vec<ExtentLocation>> {
     extents
         .iter()
         .map(|extent| {
@@ -283,7 +286,7 @@ struct DataCopy<'p> {
 fn data_copies(filepaths: &[PathBuf]) -> Result<Vec<DataCopy<'_>>, io::Error> {
     let mut copies: Vec<DataCopy<'_>> = Vec::new();
     // Copies indexed by the data they hold, sparing a scan of them all for every file
-    let mut by_key: HashMap<Vec<(u64, u64, u64)>, usize> = HashMap::new();
+    let mut by_key: HashMap<Vec<ExtentLocation>, usize> = HashMap::new();
 
     for filepath in filepaths {
         let path = filepath.as_path();

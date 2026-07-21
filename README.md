@@ -15,11 +15,11 @@ Compared to alternative solutions, `bdf` is fast and simple. It does not store a
 ## Algorithm summary
 
 1. For all files, get the file size and compute the [XXH3-64](https://github.com/Cyan4973/xxHash) \*
-2. For files with similar hashes and size, check the file content (for the extremely unlikely but possible case of a hash collision)
-3. For files with similar content, check if some Btrfs file extents are different (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html))
-4. If some extents are not shared, the files are considered duplicates candidate for reflinking
+2. For files with similar hashes and size, ask Btrfs where each file stores its data (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html)), and group the files that already share it \*
+3. Check the file content of the groups, to tell apart files that merely share a hash (for the extremely unlikely but possible case of a hash collision)
+4. Files holding the same content, but each in its own copy of the data, are considered duplicates candidate for reflinking
 
-_\* Some optimizations take place: we only compute hashes for files having the same size as at least another file. This avoids computing hashes for files which can not be duplicate anyway (the common case), and leads to a major overall speedup. Hashes are also computed in separate threads to make use of multi core CPUs._
+_\* Some optimizations take place: we only compute hashes for files having the same size as at least another file. This avoids computing hashes for files which can not be duplicate anyway (the common case), and leads to a major overall speedup. Hashes are also computed in separate threads to make use of multi core CPUs. Looking at where the data is stored before comparing content also spares reading files that already share it, and only one file per group is read for the comparison._
 
 ## Installation
 
