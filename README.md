@@ -14,12 +14,15 @@ Compared to alternative solutions, `bdf` is fast and simple. It does not store a
 
 ## Algorithm summary
 
-1. For all files, get the file size and compute the [XXH3-64](https://github.com/Cyan4973/xxHash) \*
-2. For files with similar hashes and size, ask Btrfs where each file stores its data (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html)), and group the files that already share it \*
-3. Check the file content of the groups, to tell apart files that merely share a hash (for the extremely unlikely but possible case of a hash collision)
-4. Files holding the same content, but each in its own copy of the data, are considered duplicates candidate for reflinking
+1. Walk the input tree with parallel threads, and get the size of every file \*
+2. For sizes shared by three files or more, compute the [XXH3-64](https://github.com/Cyan4973/xxHash) of each file \*\*
+3. For files with the same hash and size, or pairs of files alone sharing a size, ask Btrfs where each file stores its data (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html)), and group the files that already share it
+4. Compare one file per copy of the data to confirm the content is identical, which for hashed groups also catches the extremely unlikely but possible case of a hash collision
+5. Files holding the same content, but each in its own copy of the data, are considered duplicates candidate for reflinking
 
-_\* Some optimizations take place: we only compute hashes for files having the same size as at least another file. This avoids computing hashes for files which can not be duplicate anyway (the common case), and leads to a major overall speedup. Hashes are also computed in separate threads to make use of multi core CPUs. Looking at where the data is stored before comparing content also spares reading files that already share it, and only one file per group is read for the comparison._
+_\* Files whose size no other file shares can not be duplicates, and are dismissed without reading their data (the common case), which leads to a major overall speedup. A size shared by exactly two files skips hashing entirely: directly comparing the pair reads less than hashing both files._
+
+_\*\* Hashes are computed in separate threads to make use of multi core CPUs. Before a file is read, its extents are mapped: a file mapping to the same extents as a file already picked for hashing holds the same bytes, and is attached to it without hashing it (compressed extents whose location does not pin the bytes down are first compared directly). Steps 3 and 4 also run on parallel worker threads, spare reading files whose extents show they already share their data, and read only one file per data copy for the comparison._
 
 ## Installation
 

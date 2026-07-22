@@ -6,17 +6,21 @@ use std::{
     ffi::OsStr,
     fmt,
     fs::{self, File},
-    io::{self, BufRead, Read as _, Write},
+    io::{self, BufRead as _, Read as _, Write},
     iter,
-    mem::zeroed,
+    mem::{self, zeroed},
+    ops::Range,
     os::{
         fd::AsRawFd as _,
-        unix::{ffi::OsStrExt as _, fs::MetadataExt as _},
+        unix::{
+            ffi::OsStrExt as _,
+            fs::{FileExt as _, MetadataExt as _},
+        },
     },
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -24,22 +28,78 @@ use std::{
 
 use anyhow::Context as _;
 use clap::Parser;
-use linux_raw_sys::btrfs::btrfs_ioctl_fs_info_args;
+use linux_raw_sys::{btrfs::btrfs_ioctl_fs_info_args, ioctl};
+use rayon::iter::{ParallelBridge as _, ParallelIterator as _};
 use xxhash_rust::xxh3;
 
 /// File read chunk size, in bytes
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 
+/// Number of extents fetched per FIEMAP ioctl
+///
+/// Btrfs caps a compressed extent at 128 KiB, so mapping a large compressed file takes many extents, and a batch
+/// this size still fits comfortably on the stack.
+const FIEMAP_BATCH_SIZE: u32 = 512;
+
 /// Extent flags marking a physical location that does not identify the underlying data
-const UNRESOLVED_EXTENT_FLAGS: fiemap::FiemapExtentFlags =
-    fiemap::FiemapExtentFlags::UNKNOWN.union(fiemap::FiemapExtentFlags::DELALLOC);
+const UNRESOLVED_EXTENT_FLAGS: u32 = ioctl::FIEMAP_EXTENT_UNKNOWN | ioctl::FIEMAP_EXTENT_DELALLOC;
 
 /// Extent flags marking a location that can never establish sharing
 ///
 /// Inlined data, which Btrfs copies into the destination rather than sharing, and a location left unresolved are
 /// both placeholders identical between unrelated files.
-const UNSHAREABLE_EXTENT_FLAGS: fiemap::FiemapExtentFlags =
-    UNRESOLVED_EXTENT_FLAGS.union(fiemap::FiemapExtentFlags::DATA_INLINE);
+const UNSHAREABLE_EXTENT_FLAGS: u32 = UNRESOLVED_EXTENT_FLAGS | ioctl::FIEMAP_EXTENT_DATA_INLINE;
+
+/// Largest span of file bytes one compressed Btrfs extent carries
+const BTRFS_MAX_UNCOMPRESSED: u64 = 128 * 1024;
+
+/// One mapped extent, as the FIEMAP ioctl reports it
+// Field names follow the kernel ABI
+#[expect(clippy::struct_field_names)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FiemapExtent {
+    /// Offset of the extent in the file
+    fe_logical: u64,
+    /// Location of the extent on the device
+    fe_physical: u64,
+    /// Length of the extent
+    fe_length: u64,
+    /// Reserved by the ABI
+    fe_reserved64: [u64; 2],
+    /// `FIEMAP_EXTENT_*` flags
+    fe_flags: u32,
+    /// Reserved by the ABI
+    fe_reserved: [u32; 3],
+}
+
+/// Header of a FIEMAP ioctl request, which the extent buffer directly follows in memory
+// Field names follow the kernel ABI
+#[expect(clippy::struct_field_names)]
+#[repr(C)]
+struct FiemapHeader {
+    /// First file offset to map
+    fm_start: u64,
+    /// Length of the file range to map
+    fm_length: u64,
+    /// `FIEMAP_FLAG_*` request flags
+    fm_flags: u32,
+    /// Number of extents the kernel filled
+    fm_mapped_extents: u32,
+    /// Capacity of the extent buffer
+    fm_extent_count: u32,
+    /// Reserved by the ABI
+    fm_reserved: u32,
+}
+
+/// A whole FIEMAP request, the header followed by the extent buffer it announces
+#[repr(C)]
+struct FiemapRequest {
+    /// Request header
+    header: FiemapHeader,
+    /// Extent buffer the kernel fills
+    extents: [FiemapExtent; FIEMAP_BATCH_SIZE as usize],
+}
 
 /// Convenience type for a pair of crossbeam channel ends
 type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>);
@@ -50,12 +110,24 @@ type BtrfsFsid = [u8; 16];
 /// Offset of one extent in the file, its location on the device, and its length
 type ExtentLocation = (u64, u64, u64);
 
+/// Representative of each data copy seen so far, the file kept for hashing while later files found mapping to the
+/// same extents hold its bytes and are therefore spared hashing, keyed by file size and extent key
+type SharedIndex = HashMap<(u64, Vec<ExtentLocation>), (PathBuf, Vec<PathBuf>)>;
+
 nix::ioctl_read!(
     /// Query the Btrfs filesystem holding an open file
     btrfs_fs_info,
     0x94,
     31,
     btrfs_ioctl_fs_info_args
+);
+
+nix::ioctl_readwrite!(
+    /// Map the extents of an open file, taking the request header the extent buffer follows
+    fs_fiemap,
+    b'f',
+    11,
+    FiemapHeader
 );
 
 /// Return the identifier of the Btrfs filesystem holding `path`, `None` if it is not on Btrfs
@@ -102,34 +174,75 @@ impl BtrfsFilesystem {
     }
 }
 
-/// Walk a directory tree, without leaving the Btrfs filesystem it starts on
+/// Number of directory walker threads
+const WALKER_THREADS: usize = 16;
+
+/// Walk a directory tree in parallel, yielding each regular file eligible for analysis along with its size,
+/// without leaving the Btrfs filesystem the tree starts on
 ///
 /// Subvolumes of a filesystem each have their own device, so pruning on a device change would skip them, while
 /// reflinking across them is perfectly valid.
 fn walk_btrfs_dir(
     input_dir: &Path,
-) -> anyhow::Result<impl Iterator<Item = walkdir::Result<walkdir::DirEntry>>> {
-    let mut filesystem = BtrfsFilesystem::containing(input_dir)
-        .with_context(|| format!("Failed to identify the filesystem of {input_dir:?}"))?
-        .with_context(|| format!("{input_dir:?} is not on a Btrfs filesystem"))?;
-    Ok(walkdir::WalkDir::new(input_dir)
-        .into_iter()
-        .filter_entry(move |entry| {
-            // A regular file can be a mount point of its own, so checking directories alone would let one through
-            let file_type = entry.file_type();
-            if !file_type.is_dir() && !file_type.is_file() {
-                return true;
-            }
-            let path = entry.path();
-            entry
-                .metadata()
-                .map_err(io::Error::from)
-                .and_then(|metadata| filesystem.holds(path, metadata.dev()))
-                .unwrap_or_else(|e| {
+    min_size: Option<u64>,
+) -> anyhow::Result<impl Iterator<Item = (PathBuf, u64)>> {
+    let filesystem = Mutex::new(
+        BtrfsFilesystem::containing(input_dir)
+            .with_context(|| format!("Failed to identify the filesystem of {input_dir:?}"))?
+            .with_context(|| format!("{input_dir:?} is not on a Btrfs filesystem"))?,
+    );
+
+    // An eligible file carries its size, a directory carries nothing but is kept to descend into
+    let walk = jwalk::WalkDirGeneric::<((), Option<u64>)>::new(input_dir)
+        // Dotfiles are ordinary candidates, against jwalk's default of skipping them
+        .skip_hidden(false)
+        .parallelism(jwalk::Parallelism::RayonNewPool(WALKER_THREADS))
+        .process_read_dir(move |depth, _dir, _state, entries| {
+            entries.retain_mut(|result| {
+                let Ok(entry) = result else {
+                    return true;
+                };
+                let path = entry.path();
+                // The root, at depth none, is reached through a symlink it may be named as, while entries below it
+                // are stated unfollowed; the stat also drops a regular file that is its own mount point, and sizes it
+                let metadata = if depth.is_none() {
+                    fs::metadata(&path)
+                } else {
+                    fs::symlink_metadata(&path)
+                };
+                let Ok(metadata) = metadata.inspect_err(|e| {
+                    log::warn!("Error while reading metadata of {path:?}: {e}");
+                }) else {
+                    return false;
+                };
+                if !metadata.is_dir() && !metadata.is_file() {
+                    return false;
+                }
+                // The lock guards only this quick filesystem test, which never panics, so it can not be poisoned
+                let holds = match filesystem.lock() {
+                    Ok(mut fs) => fs.holds(&path, metadata.dev()),
+                    Err(_) => return false,
+                };
+                let Ok(true) = holds.inspect_err(|e| {
                     log::warn!("Error while identifying the filesystem of {path:?}: {e}");
-                    false
-                })
-        }))
+                }) else {
+                    return false;
+                };
+                entry.client_state = metadata
+                    .is_file()
+                    .then(|| wanted_file_size(metadata.len(), min_size))
+                    .flatten();
+                metadata.is_dir() || entry.client_state.is_some()
+            });
+        })
+        .try_into_iter()?;
+
+    Ok(walk.filter_map(|result| {
+        let entry = result
+            .inspect_err(|e| log::warn!("Error while walking the tree: {e}"))
+            .ok()?;
+        entry.client_state.map(|size| (entry.path(), size))
+    }))
 }
 
 /// Command line arguments
@@ -148,13 +261,12 @@ pub struct CommandLineOpts {
 }
 
 /// Compute an XXH3-64 non-cryptographic file hash
-fn hash_file(path: &Path, hasher: &mut xxh3::Xxh3, buffer: &mut Vec<u8>) -> Result<u64, io::Error> {
-    let file = File::open(path)?;
+fn hash_file(file: &File, hasher: &mut xxh3::Xxh3, buffer: &mut Vec<u8>) -> Result<u64, io::Error> {
     hasher.reset();
     loop {
         // Unlike a bare read, read_to_end fills the whole chunk, resuming when a signal interrupts it
         buffer.clear();
-        (&file).take(READ_BUFFER_SIZE as u64).read_to_end(buffer)?;
+        file.take(READ_BUFFER_SIZE as u64).read_to_end(buffer)?;
         if buffer.is_empty() {
             break;
         }
@@ -199,70 +311,190 @@ impl fmt::Display for ProgressCounters {
 ///
 /// Both files must be the same size: reading stops at the end of `first`, so a longer `second` compares equal.
 fn same_content(first: &Path, second: &Path) -> Result<bool, io::Error> {
-    let file1 = File::open(first)?;
-    let file2 = File::open(second)?;
-    debug_assert_eq!(file1.metadata()?.len(), file2.metadata()?.len());
-    let mut buffer1 = Vec::with_capacity(READ_BUFFER_SIZE);
-    let mut buffer2 = Vec::with_capacity(READ_BUFFER_SIZE);
-    loop {
-        // Unlike a bare read, read_to_end fills the whole chunk, resuming when a signal interrupts it
-        buffer1.clear();
-        (&file1)
-            .take(READ_BUFFER_SIZE as u64)
-            .read_to_end(&mut buffer1)?;
-        if buffer1.is_empty() {
-            break;
-        }
-        buffer2.clear();
-        (&file2)
-            .take(READ_BUFFER_SIZE as u64)
-            .read_to_end(&mut buffer2)?;
-        if buffer1 != buffer2 {
-            return Ok(false);
+    let first = File::open(first)?;
+    let second = File::open(second)?;
+    // One range spanning the whole file, which same_ranges clamps to its actual size
+    let whole_file = 0..u64::MAX;
+    same_ranges(&first, &second, &[whole_file])
+}
+
+/// Test if two files of the same size have the same content over every given range
+///
+/// Extent lengths are block aligned, so a range reaching past the end of the files is clamped to it.
+fn same_ranges(first: &File, second: &File, ranges: &[Range<u64>]) -> Result<bool, io::Error> {
+    let size = first.metadata()?.len();
+    debug_assert_eq!(size, second.metadata()?.len());
+    let mut buffer1 = Vec::new();
+    let mut buffer2 = Vec::new();
+    for range in ranges {
+        let mut offset = range.start;
+        let end = range.end.min(size);
+        while offset < end {
+            let chunk = (end - offset).min(READ_BUFFER_SIZE as u64);
+            let length = usize::try_from(chunk).map_err(io::Error::other)?;
+            buffer1.resize(length, 0);
+            buffer2.resize(length, 0);
+            first.read_exact_at(&mut buffer1, offset)?;
+            second.read_exact_at(&mut buffer2, offset)?;
+            if buffer1 != buffer2 {
+                return Ok(false);
+            }
+            offset += chunk;
         }
     }
     Ok(true)
 }
 
-/// Map the extents of a file, flushing pending writes first
-fn file_extents(path: &Path) -> Result<Vec<fiemap::FiemapExtent>, io::Error> {
-    let file = File::open(path)?;
-    // Data under delayed allocation is reported without a location, hiding whether it will be inlined
-    file.sync_data()?;
-    fiemap::Fiemap::new(&file).collect()
+/// Map the extents of an open file, having the kernel flush pending writes first when `sync` is set
+///
+/// Data under delayed allocation is reported without a location, which only a flush resolves, hiding whether it
+/// will be inlined.
+fn file_extents(file: &File, sync: bool) -> Result<Vec<FiemapExtent>, io::Error> {
+    let mut extents: Vec<FiemapExtent> = Vec::new();
+    // SAFETY: every field is an integer, for which zero is a valid value
+    let mut request: FiemapRequest = unsafe { zeroed() };
+    loop {
+        request.header = FiemapHeader {
+            fm_start: extents
+                .last()
+                .map_or(0, |last| last.fe_logical + last.fe_length),
+            fm_length: u64::MAX,
+            // One flush resolves delayed allocation for the whole file, so further batches skip it
+            fm_flags: if sync && extents.is_empty() {
+                ioctl::FIEMAP_FLAG_SYNC
+            } else {
+                0
+            },
+            fm_mapped_extents: 0,
+            fm_extent_count: FIEMAP_BATCH_SIZE,
+            fm_reserved: 0,
+        };
+        // SAFETY: the ioctl writes at most `fm_extent_count` extents into the buffer following the header, which
+        // `FiemapRequest` lays out with that capacity
+        unsafe { fs_fiemap(file.as_raw_fd(), &raw mut request.header) }?;
+        let mapped = request.header.fm_mapped_extents as usize;
+        extents.extend(request.extents.iter().take(mapped).copied());
+        if mapped < FIEMAP_BATCH_SIZE as usize
+            || extents
+                .last()
+                .is_some_and(|last| last.fe_flags & ioctl::FIEMAP_EXTENT_LAST != 0)
+        {
+            return Ok(extents);
+        }
+    }
 }
 
 /// Whether a file stores its data in filesystem metadata rather than in a data extent
-fn is_inlined(extents: &[fiemap::FiemapExtent]) -> bool {
-    extents.iter().any(|extent| {
-        extent
-            .fe_flags
-            .contains(fiemap::FiemapExtentFlags::DATA_INLINE)
-    })
-}
-
-/// Whether a file holds compressed data, whose offset within its extent the mapping leaves out
-fn is_encoded(extents: &[fiemap::FiemapExtent]) -> bool {
+fn is_inlined(extents: &[FiemapExtent]) -> bool {
     extents
         .iter()
-        .any(|extent| extent.fe_flags.contains(fiemap::FiemapExtentFlags::ENCODED))
+        .any(|extent| extent.fe_flags & ioctl::FIEMAP_EXTENT_DATA_INLINE != 0)
 }
 
 /// Identify the data a file maps to, `None` when its extents can not establish sharing
 ///
 /// Files sharing a key hold the same bytes, save for compressed extents, which several contents can share. The
 /// logical offset is part of it, as the same extent mapped elsewhere in the file puts its bytes elsewhere too.
-fn extent_key(extents: &[fiemap::FiemapExtent]) -> Option<Vec<ExtentLocation>> {
+fn extent_key(extents: &[FiemapExtent]) -> Option<Vec<ExtentLocation>> {
     extents
         .iter()
         .map(|extent| {
-            (!extent.fe_flags.intersects(UNSHAREABLE_EXTENT_FLAGS)).then_some((
+            (extent.fe_flags & UNSHAREABLE_EXTENT_FLAGS == 0).then_some((
                 extent.fe_logical,
                 extent.fe_physical,
                 extent.fe_length,
             ))
         })
         .collect()
+}
+
+/// Identify the ranges of the file whose extents leave the bytes unproven between files sharing them
+///
+/// The mapping omits the offset of the data inside a compressed extent, so an extent shorter than the largest
+/// Btrfs writes may cover any range of a larger extent, and files mapping to it can hold different bytes.
+fn ambiguous_ranges(extents: &[FiemapExtent]) -> Vec<Range<u64>> {
+    extents
+        .iter()
+        .filter(|extent| {
+            extent.fe_flags & ioctl::FIEMAP_EXTENT_ENCODED != 0
+                && extent.fe_length != BTRFS_MAX_UNCOMPRESSED
+        })
+        .map(|extent| extent.fe_logical..extent.fe_logical + extent.fe_length)
+        .collect()
+}
+
+/// Record `file` in the index of content seen so far, attaching `path` to the entry sharing its bytes if any
+///
+/// Returns whether the file was attached, sparing its hashing; a fresh key starts a new entry instead, for later
+/// files to attach to. Sharing every extent proves the bytes shared, except over ambiguous ranges, which are
+/// compared before trusting the entry; a mismatch, an error on this file alone, or a comparison that would read
+/// at least as much as hashing all leave the file to hashing.
+fn try_attach_shared(
+    shared_index: &Mutex<SharedIndex>,
+    file: &File,
+    path: &Path,
+    file_size: u64,
+) -> anyhow::Result<bool> {
+    // Pending writes are not flushed: delayed allocation yields no key, and the file simply falls through to
+    // hashing
+    let extents = match file_extents(file, false) {
+        Ok(extents) => extents,
+        Err(e) => {
+            log::warn!("Error while reading extents of {path:?}: {e}");
+            return Ok(false);
+        }
+    };
+    let Some(key) = extent_key(&extents) else {
+        return Ok(false);
+    };
+    let ambiguous = ambiguous_ranges(&extents);
+    drop(extents);
+
+    let (index_key, representative) = {
+        let mut shared_index = shared_index
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned lock: {e}"))?;
+        let mut known = match shared_index.entry((file_size, key)) {
+            Entry::Occupied(known) => known,
+            Entry::Vacant(slot) => {
+                slot.insert((path.to_path_buf(), Vec::new()));
+                return Ok(false);
+            }
+        };
+        if ambiguous.is_empty() {
+            known.get_mut().1.push(path.to_path_buf());
+            return Ok(true);
+        }
+        // Confirming reads the ranges out of both files, so from half the file on, hashing reads no more
+        let ambiguous_total: u64 = ambiguous.iter().map(|range| range.end - range.start).sum();
+        if ambiguous_total * 2 >= file_size {
+            return Ok(false);
+        }
+        (known.key().clone(), known.get().0.clone())
+    };
+
+    // The comparison reads both files, which would stall the other workers if it held the index lock
+    let Ok(shares) = File::open(&representative)
+        .and_then(|rep| same_ranges(&rep, file, &ambiguous))
+        .inspect_err(|e| log::warn!("Error while comparing {path:?} with {representative:?}: {e}"))
+    else {
+        return Ok(false);
+    };
+    if !shares {
+        log::warn!(
+            "Files {representative:?} and {path:?} share a compressed extent but hold different data"
+        );
+        return Ok(false);
+    }
+    shared_index
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Poisoned lock: {e}"))?
+        .get_mut(&index_key)
+        // Entries are never removed, so the entry just found is still there
+        .ok_or_else(|| anyhow::anyhow!("Shared index entry vanished"))?
+        .1
+        .push(path.to_path_buf());
+    Ok(true)
 }
 
 /// One copy of a file content on disk, and the files already sharing it
@@ -272,81 +504,88 @@ struct DataCopy<'p> {
     path: &'p Path,
     /// Whether the data sits in filesystem metadata, which reflinking can not share
     inlined: bool,
-    /// Whether the data is compressed, which the extents alone can not tell apart from another content
-    encoded: bool,
-    /// Further files mapping to the extents of `path`, holding its data unless `encoded` leaves that to confirm
+    /// Further files that map to the extents of `path` and hold its data
     shared: Vec<&'p Path>,
 }
 
-/// Group files sharing a size and hash by the copy of the data they hold
+/// Find the index in `copies` of the variant among `variants` holding the data of `file`, or `None` for a
+/// fresh content
 ///
-/// Files mapping to the same extents hold the same bytes, so grouping them ahead of any content comparison spares
-/// reading data that is already shared. Compression is the exception, which `confirm_shared` settles for the files
-/// that end up reported.
+/// Files sharing a key hold identical bytes save over ambiguous compressed ranges, so an unambiguous file joins
+/// the sole variant a key can then have, while a compressed one is compared over those ranges against each.
+fn matching_variant(
+    copies: &[DataCopy<'_>],
+    variants: &[usize],
+    file: &File,
+    ambiguous: &[Range<u64>],
+) -> Result<Option<usize>, io::Error> {
+    if ambiguous.is_empty() {
+        return Ok(variants.first().copied());
+    }
+    for &index in variants {
+        // Variants hold indices filled from `copies.len()`, so they always resolve
+        #[expect(clippy::indexing_slicing)]
+        let representative = File::open(copies[index].path)?;
+        if same_ranges(&representative, file, ambiguous)? {
+            return Ok(Some(index));
+        }
+    }
+    Ok(None)
+}
+
+/// Group candidate files sharing a size by the copy of the data they hold
+///
+/// Files mapping to the same extents hold the same bytes, so grouping them ahead of any further reading spares
+/// comparing data that is already shared. Compression is the exception: files sharing a key can differ over the
+/// ranges its short extents cover, so those are compared to keep genuinely distinct contents in their own copy.
 fn data_copies(filepaths: &[PathBuf]) -> Result<Vec<DataCopy<'_>>, io::Error> {
     let mut copies: Vec<DataCopy<'_>> = Vec::new();
-    // Copies indexed by the data they hold, sparing a scan of them all for every file
-    let mut by_key: HashMap<Vec<ExtentLocation>, usize> = HashMap::new();
+    // Copies indexed by the data they hold, several variants to a key when compressed extents make it ambiguous
+    let mut by_key: HashMap<Vec<ExtentLocation>, Vec<usize>> = HashMap::new();
 
     for filepath in filepaths {
         let path = filepath.as_path();
-        let extents = file_extents(filepath)?;
-        let copy = DataCopy {
-            path,
-            inlined: is_inlined(&extents),
-            encoded: is_encoded(&extents),
-            shared: Vec::new(),
-        };
-        let Some(key) = extent_key(&extents) else {
-            // Extents identifying nothing keep the file to itself, even against another file mapping the same way
-            copies.push(copy);
+        // A file that can not be opened is skipped rather than fatal, as it is when hashing
+        let Ok(file) = File::open(filepath).inspect_err(|e| {
+            log::warn!("Error while opening {path:?}: {e}");
+        }) else {
             continue;
         };
+        let extents = file_extents(&file, true)?;
+        let inlined = is_inlined(&extents);
+        let Some(key) = extent_key(&extents) else {
+            // Extents identifying nothing keep the file to itself, even against another file mapping the same way
+            copies.push(DataCopy {
+                path,
+                inlined,
+                shared: Vec::new(),
+            });
+            continue;
+        };
+        let ambiguous = ambiguous_ranges(&extents);
         drop(extents);
 
-        // The index is inserted below from `copies.len()`, so it always resolves
-        #[expect(clippy::indexing_slicing)]
-        match by_key.entry(key) {
-            Entry::Occupied(known) => {
-                let known = &mut copies[*known.get()];
-                // A key carries no compression flag, so the copy takes that of every file joining it
-                known.encoded |= copy.encoded;
-                known.shared.push(path);
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(copies.len());
-                copies.push(copy);
-            }
+        let variants = by_key.entry(key).or_default();
+        if let Some(index) = matching_variant(&copies, variants, &file, &ambiguous)? {
+            // Variants hold indices filled from `copies.len()`, so they always resolve
+            #[expect(clippy::indexing_slicing)]
+            copies[index].shared.push(path);
+        } else {
+            variants.push(copies.len());
+            copies.push(DataCopy {
+                path,
+                inlined,
+                shared: Vec::new(),
+            });
         }
     }
     Ok(copies)
 }
 
-/// Files sharing the extents of `other` that hold the content of `first`
+/// Partition the copies of one candidate group into classes of identical content
 ///
-/// A compressed extent is reported without the offset its data sits at, so files grouped on one can differ. The
-/// first file of a copy needs no confirming, the content classes having compared it.
-fn confirm_shared<'p>(first_path: &Path, other: &DataCopy<'p>) -> Result<Vec<&'p Path>, io::Error> {
-    if !other.encoded {
-        return Ok(other.shared.clone());
-    }
-    let mut confirmed = Vec::new();
-    for &path in &other.shared {
-        if same_content(first_path, path)? {
-            confirmed.push(path);
-        } else {
-            log::warn!(
-                "Files {first_path:?} and {path:?} share a compressed extent but hold different data"
-            );
-        }
-    }
-    Ok(confirmed)
-}
-
-/// Partition the copies of files sharing a size and hash into classes of identical content
-///
-/// Each class is its first copy, standing for the whole class, followed by the others. More than one class means
-/// the hash collided.
+/// Each class is its first copy, standing for the whole class, followed by the others. In a hashed group, more
+/// than one class means the hash collided; in an unhashed pair, that the size matched by chance.
 fn content_classes<'c, 'p>(
     copies: &'c [DataCopy<'p>],
 ) -> Result<Vec<(&'c DataCopy<'p>, Vec<&'c DataCopy<'p>>)>, io::Error> {
@@ -364,22 +603,6 @@ fn content_classes<'c, 'p>(
     Ok(classes)
 }
 
-/// Read a NUL terminated path into `buf`, stripping the terminator, `None` at end of input
-fn read_nul_path<'b, R>(reader: &mut R, buf: &'b mut Vec<u8>) -> Result<Option<&'b Path>, io::Error>
-where
-    R: BufRead,
-{
-    buf.clear();
-    if reader.read_until(0, buf)? == 0 {
-        return Ok(None);
-    }
-    // Last path may not be terminated if input does not end with a separator
-    if buf.last() == Some(&0) {
-        buf.pop();
-    }
-    Ok(Some(Path::new(OsStr::from_bytes(buf))))
-}
-
 /// Write a NUL terminated duplicate pair
 fn write_pair<W>(writer: &mut W, first: &Path, second: &Path) -> Result<(), io::Error>
 where
@@ -391,91 +614,135 @@ where
     writer.write_all(b"\0")
 }
 
-/// Report the duplicate pairs of every group of files sharing a size and hash
-///
-/// A pair names the file to reflink onto, then the one to replace, so the output feeds `cp --reflink` directly.
-fn report_duplicates<W>(
-    files: &HashMap<(u64, u64), Vec<PathBuf>>,
+/// Report the duplicate pairs of one group of files sharing a size, and a hash unless the size alone held it to
+/// two files
+fn report_group<W>(
+    filepaths: &[PathBuf],
+    hashed: bool,
     counters: &ProgressCounters,
-    writer: &mut W,
+    writer: &Mutex<&mut W>,
 ) -> Result<(), io::Error>
 where
     W: Write,
 {
-    for filepaths in files.values() {
-        let copies = data_copies(filepaths)?;
-        let classes = content_classes(&copies)?;
-        if classes.len() > 1 {
-            log::warn!(
-                "Files {filepaths:?} have the same size and hash but {count} distinct contents",
-                count = classes.len()
-            );
-            counters
-                .hash_collision
-                .fetch_add(classes.len() - 1, Ordering::Relaxed);
-        }
+    let copies = data_copies(filepaths)?;
+    let classes = content_classes(&copies)?;
+    // An unhashed pair holding two contents is a size shared by chance, not a collision
+    if hashed && classes.len() > 1 {
+        log::warn!(
+            "Files {filepaths:?} have the same size and hash but {count} distinct contents",
+            count = classes.len()
+        );
+        counters
+            .hash_collision
+            .fetch_add(classes.len() - 1, Ordering::Relaxed);
+    }
 
-        for (first, others) in classes {
-            let first_path = first.path;
-            for shared in &first.shared {
-                log::debug!("Files {first_path:?} and {shared:?} are already reflinked");
-                counters.reflinked.fetch_add(1, Ordering::Relaxed);
+    for (first, others) in classes {
+        let first_path = first.path;
+        for &shared in &first.shared {
+            log::debug!("Files {first_path:?} and {shared:?} are already reflinked");
+            counters.reflinked.fetch_add(1, Ordering::Relaxed);
+        }
+        for other in others {
+            let other_path = other.path;
+            // Reflinking an inlined file onto one holding a regular extent releases that extent, so only a
+            // pair inlined on both sides has nothing to gain
+            if first.inlined && other.inlined {
+                log::debug!(
+                    "Files {first_path:?} and {other_path:?} have inlined data, reflinking would not free space"
+                );
+                counters.inlined.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
-            for other in others {
-                let other_path = other.path;
-                // Reflinking an inlined file onto one holding a regular extent releases that extent, so only a
-                // pair inlined on both sides has nothing to gain
-                if first.inlined && other.inlined {
-                    log::debug!(
-                        "Files {first_path:?} and {other_path:?} have inlined data, reflinking would not free space"
-                    );
-                    counters.inlined.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                // Every file of the other copy needs its own reflink, sharing among them leaving the copy behind
-                for path in iter::once(other_path).chain(confirm_shared(first_path, other)?) {
-                    log::debug!("Files {first_path:?} and {path:?} are duplicates");
-                    counters.duplicate_candidate.fetch_add(1, Ordering::Relaxed);
-                    write_pair(writer, first_path, path)?;
-                }
+            // Every file of the other copy needs its own reflink, sharing among them leaving the copy behind
+            for path in iter::once(other_path).chain(other.shared.iter().copied()) {
+                log::debug!("Files {first_path:?} and {path:?} are duplicates");
+                counters.duplicate_candidate.fetch_add(1, Ordering::Relaxed);
+                let mut writer = writer
+                    .lock()
+                    .map_err(|e| io::Error::other(format!("Poisoned lock: {e}")))?;
+                write_pair(&mut **writer, first_path, path)?;
             }
         }
     }
     Ok(())
 }
 
-/// Read path metadata without following symlinks, warning when it can not be read
-fn path_metadata(path: &Path) -> Option<fs::Metadata> {
-    fs::symlink_metadata(path)
-        .inspect_err(|e| log::warn!("Error while reading metadata of {path:?}: {e}"))
-        .ok()
+/// Report the duplicate pairs of every hashed group and unhashed size pair, spreading groups over a Rayon pool
+///
+/// A pair names the file to reflink onto, then the one to replace, so the output feeds `cp --reflink` directly.
+fn report_duplicates<W>(
+    files: &HashMap<(u64, u64), Vec<PathBuf>>,
+    pair_groups: &[Vec<PathBuf>],
+    counters: &ProgressCounters,
+    writer: &mut W,
+) -> anyhow::Result<()>
+where
+    W: Write + Send,
+{
+    let writer = Mutex::new(writer);
+    // Tag each group with whether it was hashed, telling a hash collision apart from a coincidental size match
+    files
+        .values()
+        .map(|filepaths| (filepaths, true))
+        .chain(pair_groups.iter().map(|filepaths| (filepaths, false)))
+        .par_bridge()
+        .try_for_each(|(filepaths, hashed)| report_group(filepaths, hashed, counters, &writer))?;
+    Ok(())
 }
 
-/// Return the size when a file this large should be hashed
+/// Return the size when a file this large should be considered
 fn wanted_file_size(file_size: u64, min_size: Option<u64>) -> Option<u64> {
     // Don't bother for empty files
     (file_size != 0 && min_size.is_none_or(|minimum| file_size >= minimum)).then_some(file_size)
 }
 
-/// Tracks the sizes seen so far, withholding the first file of each until a second file of that size shows up
+/// Files seen so far for one size
+enum SizeEntry {
+    /// A single file, which can not have a duplicate yet
+    One(PathBuf),
+    /// Exactly two files, withheld for a direct comparison, which reads less than hashing them
+    Pair(PathBuf, PathBuf),
+    /// Three files or more, whose hashes partition the size into content groups cheaper than comparisons would
+    Hashing,
+}
+
+/// Tracks the sizes seen so far, withholding files until enough share a size to settle how to check them
 ///
 /// Identical files have identical sizes, so a file whose size no other file shares can not have a duplicate, and
-/// hashing it would read it in full for nothing.
+/// hashing it would read it in full for nothing. A size shared by exactly two files is settled by comparing them
+/// directly, so hashing only pays once a third file shows up.
 #[derive(Default)]
-struct SizeTracker(HashMap<u64, Option<PathBuf>>);
+struct SizeTracker(HashMap<u64, SizeEntry>);
 
 impl SizeTracker {
-    /// Take in a file, returning the files whose size is now known to be shared, and which are therefore worth
-    /// hashing: none while the size is unique so far, both the withheld file and this one when it completes a first
-    /// pair, this one alone afterwards
-    fn track(&mut self, path: PathBuf, file_size: u64) -> [Option<PathBuf>; 2] {
+    /// Take in a file, returning the files whose size is now known to need hashing: none while the size holds two
+    /// files or fewer, the three withheld files when a third one ends the direct comparison plan, this one alone
+    /// afterwards
+    fn track(&mut self, path: PathBuf, file_size: u64) -> [Option<PathBuf>; 3] {
         match self.0.entry(file_size) {
             Entry::Vacant(e) => {
-                e.insert(Some(path));
-                [None, None]
+                e.insert(SizeEntry::One(path));
+                [None, None, None]
             }
-            Entry::Occupied(mut e) => [e.get_mut().take(), Some(path)],
+            Entry::Occupied(mut e) => match mem::replace(e.get_mut(), SizeEntry::Hashing) {
+                SizeEntry::One(first) => {
+                    *e.get_mut() = SizeEntry::Pair(first, path);
+                    [None, None, None]
+                }
+                SizeEntry::Pair(first, second) => [Some(first), Some(second), Some(path)],
+                SizeEntry::Hashing => [None, None, Some(path)],
+            },
         }
+    }
+
+    /// Drain the sizes holding exactly two files, which a direct comparison settles without hashing
+    fn into_pairs(self) -> impl Iterator<Item = Vec<PathBuf>> {
+        self.0.into_values().filter_map(|entry| match entry {
+            SizeEntry::Pair(first, second) => Some(vec![first, second]),
+            SizeEntry::One(_) | SizeEntry::Hashing => None,
+        })
     }
 }
 
@@ -489,7 +756,11 @@ fn main() -> anyhow::Result<()> {
     // Parse command line opts
     let cl_opts = CommandLineOpts::parse();
     log::trace!("{cl_opts:?}");
-    let dir_walk = cl_opts.dir.as_deref().map(walk_btrfs_dir).transpose()?;
+    let dir_walk = cl_opts
+        .dir
+        .as_deref()
+        .map(|dir| walk_btrfs_dir(dir, cl_opts.min_size))
+        .transpose()?;
 
     // Get usable core count
     let cpu_count = thread::available_parallelism()?.get();
@@ -502,6 +773,9 @@ fn main() -> anyhow::Result<()> {
 
     // File hash map
     let mut files: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
+
+    // Files found to share the extents of an already tracked file, which hashing can skip
+    let shared_index: Mutex<SharedIndex> = Mutex::new(HashMap::new());
 
     // Progress
     let progress_counters = Arc::new(ProgressCounters::default());
@@ -520,7 +794,7 @@ fn main() -> anyhow::Result<()> {
     );
     progress.enable_steady_tick(Duration::from_millis(300));
 
-    thread::scope(|scope| -> anyhow::Result<()> {
+    let pair_groups = thread::scope(|scope| -> anyhow::Result<Vec<Vec<PathBuf>>> {
         // Worker threads
         let worker_count = max(cpu_count - 1, 1);
         let mut workers = Vec::with_capacity(worker_count);
@@ -529,12 +803,25 @@ fn main() -> anyhow::Result<()> {
             let to_hashed_rx = to_hashed_rx.clone();
             let hashed_tx = hashed_tx.clone();
             let progress_counters = Arc::clone(&progress_counters);
+            let shared_index = &shared_index;
 
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
                 let mut hasher = xxh3::Xxh3::new();
                 let mut buffer = Vec::with_capacity(READ_BUFFER_SIZE);
                 while let Ok((path, file_size)) = to_hashed_rx.recv() {
-                    let Ok(hash) = hash_file(&path, &mut hasher, &mut buffer).inspect_err(|e| {
+                    let Ok(file) = File::open(&path).inspect_err(|e| {
+                        log::warn!("Error while hashing {path:?}: {e}");
+                    }) else {
+                        continue;
+                    };
+
+                    // Files mapping to the extents of an already tracked file hold its bytes, so probing the
+                    // extents first spares reading data that is already shared
+                    if try_attach_shared(shared_index, &file, &path, file_size)? {
+                        continue;
+                    }
+
+                    let Ok(hash) = hash_file(&file, &mut hasher, &mut buffer).inspect_err(|e| {
                         log::warn!("Error while hashing {path:?}: {e}");
                     }) else {
                         continue;
@@ -554,40 +841,25 @@ fn main() -> anyhow::Result<()> {
 
         // Iterate over files
         let mut size_tracker = SizeTracker::default();
-        if let Some(dir_walk) = dir_walk {
-            for entry in dir_walk {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => {
-                        log::warn!("{e}");
-                        continue;
-                    }
-                };
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let Some(metadata) = path_metadata(entry.path()) else {
-                    continue;
-                };
-                let Some(file_size) = wanted_file_size(metadata.len(), cl_opts.min_size) else {
-                    continue;
-                };
-                let path = entry.path();
+        if let Some(walk) = dir_walk {
+            for (path, file_size) in walk {
                 log::debug!("{path:?}");
                 progress_counters.file.fetch_add(1, Ordering::Relaxed);
 
-                let tracked = size_tracker.track(path.to_path_buf(), file_size);
+                let tracked = size_tracker.track(path, file_size);
                 for to_hash in tracked.into_iter().flatten() {
                     to_hashed_tx.send((to_hash, file_size))?;
                 }
             }
         } else {
-            let mut stdin_locked = io::stdin().lock();
-            let mut buf = Vec::new();
             // Reflinks can not cross filesystems, so every input has to be on the one the first input is on
             let mut filesystem: Option<BtrfsFilesystem> = None;
-            while let Some(path) = read_nul_path(&mut stdin_locked, &mut buf)? {
-                let Some(metadata) = path_metadata(path) else {
+            for bytes in io::stdin().lock().split(0) {
+                let bytes = bytes?;
+                let path = Path::new(OsStr::from_bytes(&bytes));
+                let Ok(metadata) = fs::symlink_metadata(path).inspect_err(|e| {
+                    log::warn!("Error while reading metadata of {path:?}: {e}");
+                }) else {
                     continue;
                 };
                 if !metadata.is_file() {
@@ -632,6 +904,9 @@ fn main() -> anyhow::Result<()> {
         }
         drop(to_hashed_tx);
 
+        // Sizes left holding exactly two files go to a direct comparison, which their hashing would only repeat
+        let pair_groups: Vec<Vec<PathBuf>> = size_tracker.into_pairs().collect();
+
         // Fill hashmap
         for (filepath, file_size, hash) in &hashed_rx {
             files.entry((file_size, hash)).or_default().push(filepath);
@@ -642,15 +917,35 @@ fn main() -> anyhow::Result<()> {
             worker
                 .join()
                 .map_err(|e| anyhow::anyhow!("Worker thread panicked: {e:?}"))?
-        })
+        })?;
+        Ok(pair_groups)
     })?;
 
-    // Remove unique hashes
-    files.retain(|_key, filepaths| filepaths.len() > 1);
+    // Index the files spared hashing by their hashed representative
+    let shared_members: HashMap<PathBuf, Vec<PathBuf>> = shared_index
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("Poisoned lock: {e}"))?
+        .into_values()
+        .filter(|(_path, members)| !members.is_empty())
+        .collect();
+
+    // Remove unique hashes, folding every file spared hashing into the group of the representative standing for
+    // it, and keeping a lone hash whose file stands for shared ones
+    files.retain(|_key, filepaths| {
+        let members: Vec<PathBuf> = filepaths
+            .iter()
+            .filter_map(|path| shared_members.get(path))
+            .flatten()
+            .cloned()
+            .collect();
+        let keep = filepaths.len() > 1 || !members.is_empty();
+        filepaths.extend(members);
+        keep
+    });
 
     // Find candidates
-    let mut stdout = io::stdout().lock();
-    report_duplicates(&files, &progress_counters, &mut stdout)?;
+    let mut stdout = io::stdout();
+    report_duplicates(&files, &pair_groups, &progress_counters, &mut stdout)?;
 
     progress.finish();
 
@@ -661,10 +956,13 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use std::{
         io::Seek as _,
+        os::unix::fs::symlink,
         process::{Command, Stdio},
     };
 
     use linux_raw_sys::btrfs::{file_clone_range, FS_COMPR_FL};
+    // The test build of the binary links every dev-dependency, and this one only serves the benches
+    use walkdir as _;
 
     use super::*;
 
@@ -754,15 +1052,20 @@ mod tests {
         File::open(path).unwrap().sync_data().unwrap();
     }
 
-    /// Clone `length` bytes of `source` at `offset` into a new file at `path`
-    fn clone_range(source: &Path, offset: u64, length: u64, path: &Path) {
+    /// Clone `length` bytes of `source` at `offset` into `path` at `dest_offset`, creating the file if needed
+    fn clone_range(source: &Path, offset: u64, length: u64, path: &Path, dest_offset: u64) {
         let source_file = File::open(source).unwrap();
-        let file = File::create(path).unwrap();
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
         let args = file_clone_range {
             src_fd: source_file.as_raw_fd().into(),
             src_offset: offset,
             src_length: length,
-            dest_offset: 0,
+            dest_offset,
         };
         // SAFETY: the ioctl reads `size_of::<file_clone_range>()` bytes from `args`
         unsafe { btrfs_clone_range(file.as_raw_fd(), &raw const args) }.unwrap();
@@ -785,18 +1088,22 @@ mod tests {
         (dir.join("first"), dir.join("second"))
     }
 
-    /// Map both files and test whether they already share their data, as the candidate reporting does
-    fn files_share_extents(first: &Path, second: &Path) -> bool {
-        let key = extent_key(&file_extents(first).unwrap());
-        key.is_some() && key == extent_key(&file_extents(second).unwrap())
+    /// Map a file by path, flushing it first, as the candidate reporting does
+    fn path_extents(path: &Path) -> Vec<FiemapExtent> {
+        file_extents(&File::open(path).unwrap(), true).unwrap()
     }
 
-    /// Build an unencoded, extent backed copy holding the given files
+    /// Map both files and test whether their extents yield the same key, as the candidate reporting does
+    fn files_have_same_extent_key(first: &Path, second: &Path) -> bool {
+        let key = extent_key(&path_extents(first));
+        key.is_some() && key == extent_key(&path_extents(second))
+    }
+
+    /// Build an extent backed copy holding the given files
     fn plain_copy<'p>(path: &'p Path, shared: Vec<&'p Path>) -> DataCopy<'p> {
         DataCopy {
             path,
             inlined: false,
-            encoded: false,
             shared,
         }
     }
@@ -810,11 +1117,8 @@ mod tests {
     }
 
     /// Map a file without flushing it, leaving delayed allocation unresolved
-    fn unflushed_extents(path: &Path) -> Vec<fiemap::FiemapExtent> {
-        fiemap::fiemap(path)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
+    fn unflushed_extents(path: &Path) -> Vec<FiemapExtent> {
+        file_extents(&File::open(path).unwrap(), false).unwrap()
     }
 
     /// Write two files and compare their content, as the candidate reporting does
@@ -934,6 +1238,21 @@ mod tests {
     }
 
     #[test]
+    fn data_copies_skips_missing_files_and_groups_remaining_reflinks() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        // A path that can not be opened is skipped, and does not abort the group forming behind it
+        let paths = vec![dir.path().join("missing"), first.clone(), second.clone()];
+
+        assert_eq!(
+            data_copies(&paths).unwrap(),
+            vec![plain_copy(&first, vec![second.as_path()])]
+        );
+    }
+
+    #[test]
     fn data_copies_indexes_interleaved_reflink_sets() {
         let Some(dir) = btrfs_test_dir() else { return };
         let (first, second) = pair_paths(dir.path());
@@ -966,56 +1285,173 @@ mod tests {
         let base = dir.join("base");
         write_compressed(&base, EXTENT_SIZE);
         // Btrfs compresses in 128 KiB units, so both ranges fall inside one extent
-        clone_range(&base, 0, CLONE_RANGE_SIZE, &first);
-        clone_range(&base, CLONE_RANGE_SIZE, CLONE_RANGE_SIZE, &second);
+        clone_range(&base, 0, CLONE_RANGE_SIZE, &first, 0);
+        clone_range(&base, CLONE_RANGE_SIZE, CLONE_RANGE_SIZE, &second, 0);
 
-        let first_extents = file_extents(&first).unwrap();
-        assert!(is_encoded(&first_extents));
+        let first_extents = path_extents(&first);
+        assert!(!ambiguous_ranges(&first_extents).is_empty());
         assert_eq!(
             extent_key(&first_extents),
-            extent_key(&file_extents(&second).unwrap())
+            extent_key(&path_extents(&second))
         );
         assert_ne!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
         (first, second)
     }
 
     #[test]
-    fn data_copies_ranges_of_one_compressed_extent_form_one_copy() {
+    fn data_copies_splits_differing_compressed_ranges() {
         let Some(dir) = btrfs_test_dir() else { return };
         let (first, second) = clone_compressed_ranges(dir.path());
         let paths = vec![first.clone(), second.clone()];
 
-        // A compressed extent is reported without the offset its data sits at, so the extents group the files
-        // although they differ, leaving them for confirm_shared to tell apart
+        // A compressed extent is reported without the offset its data sits at, so the shared key alone would
+        // group the files although they differ, which comparing the ambiguous ranges tells apart
         assert_eq!(
             data_copies(&paths).unwrap(),
-            vec![DataCopy {
-                encoded: true,
-                ..plain_copy(&first, vec![second.as_path()])
-            }]
+            vec![plain_copy(&first, vec![]), plain_copy(&second, vec![])]
         );
     }
 
     #[test]
-    fn confirm_shared_does_not_read_unencoded_members() {
+    fn ambiguous_ranges_of_compressed_tail() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_compressed(&path, EXTENT_SIZE);
+
+        let extents = path_extents(&path);
+        assert!(extents.len() >= 3);
+        // Only the tail extent falls short of the largest compressed extent, whose full coverage is unambiguous
+        let tail_start = EXTENT_SIZE as u64 / BTRFS_MAX_UNCOMPRESSED * BTRFS_MAX_UNCOMPRESSED;
+        assert_eq!(
+            ambiguous_ranges(&extents),
+            vec![tail_start..EXTENT_SIZE as u64]
+        );
+    }
+
+    #[test]
+    fn ambiguous_ranges_none_for_incompressible_data() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_flushed(&path, EXTENT_SIZE);
+
+        assert_eq!(ambiguous_ranges(&path_extents(&path)), vec![]);
+    }
+
+    #[test]
+    fn same_ranges_clamps_to_file_end() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        // An unaligned size makes the tail extent reach past the bytes the file holds
+        let size = EXTENT_SIZE + 100;
+        write_compressed(&first, size);
+        fs::copy(&first, &second).unwrap();
+
+        let ranges = ambiguous_ranges(&path_extents(&first));
+        assert!(ranges.iter().any(|range| range.end > size as u64));
+        assert!(same_ranges(
+            &File::open(&first).unwrap(),
+            &File::open(&second).unwrap(),
+            &ranges
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn same_ranges_checks_later_disjoint_ranges() {
         let dir = tempfile::TempDir::new().unwrap();
         let (first, second) = pair_paths(dir.path());
-        fs::write(&first, b"dup").unwrap();
-        fs::write(&second, b"dup").unwrap();
-        // Extents settle sharing on their own unless compressed, so a path that can not be opened stands in for a
-        // file taken on its extents alone
-        let missing = dir.path().join("missing");
-        let other = DataCopy {
-            path: &second,
-            inlined: false,
-            encoded: false,
-            shared: vec![missing.as_path()],
-        };
+        fs::write(&first, b"abc").unwrap();
+        fs::write(&second, b"abx").unwrap();
 
-        assert_eq!(
-            confirm_shared(&first, &other).unwrap(),
-            vec![missing.as_path()]
+        // The first range matches, so the difference in the second is only caught by checking every range
+        assert!(!same_ranges(
+            &File::open(first).unwrap(),
+            &File::open(second).unwrap(),
+            &[0..2, 2..3],
+        )
+        .unwrap());
+    }
+
+    /// Run `try_attach_shared` for a file over an index, as a hash worker does
+    fn attached(index: &Mutex<SharedIndex>, path: &Path) -> bool {
+        let file = File::open(path).unwrap();
+        let file_size = file.metadata().unwrap().len();
+        try_attach_shared(index, &file, path, file_size).unwrap()
+    }
+
+    #[test]
+    fn try_attach_shared_attaches_a_reflinked_file() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        let index = Mutex::new(HashMap::new());
+
+        assert!(!attached(&index, &first));
+        assert!(attached(&index, &second));
+        let members: Vec<_> = index.into_inner().unwrap().into_values().collect();
+        assert_eq!(members, vec![(first, vec![second])]);
+    }
+
+    #[test]
+    fn try_attach_shared_confirms_a_compressed_tail() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_compressed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        assert!(files_have_same_extent_key(&first, &second));
+        let index = Mutex::new(HashMap::new());
+
+        assert!(!attached(&index, &first));
+        assert!(attached(&index, &second));
+        let members: Vec<_> = index.into_inner().unwrap().into_values().collect();
+        assert_eq!(members, vec![(first, vec![second])]);
+    }
+
+    #[test]
+    fn try_attach_shared_rejects_a_differing_compressed_tail() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let base = dir.path().join("base");
+        write_compressed(&base, 2 * usize::try_from(BTRFS_MAX_UNCOMPRESSED).unwrap());
+        let (first, second) = pair_paths(dir.path());
+        // Both hold the first extent in full and a partial tail of the second one, at offsets the mapping does
+        // not report, so their keys match while their tails differ
+        clone_range(
+            &base,
+            0,
+            BTRFS_MAX_UNCOMPRESSED + CLONE_RANGE_SIZE,
+            &first,
+            0,
         );
+        clone_range(&base, 0, BTRFS_MAX_UNCOMPRESSED, &second, 0);
+        clone_range(
+            &base,
+            BTRFS_MAX_UNCOMPRESSED + CLONE_RANGE_SIZE,
+            CLONE_RANGE_SIZE,
+            &second,
+            BTRFS_MAX_UNCOMPRESSED,
+        );
+        assert!(files_have_same_extent_key(&first, &second));
+        assert_ne!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        let index = Mutex::new(HashMap::new());
+
+        assert!(!attached(&index, &first));
+        assert!(!attached(&index, &second));
+        let members: Vec<_> = index.into_inner().unwrap().into_values().collect();
+        assert_eq!(members, vec![(first, vec![])]);
+    }
+
+    #[test]
+    fn try_attach_shared_leaves_a_mostly_ambiguous_file_to_hashing() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = clone_compressed_ranges(dir.path());
+        let index = Mutex::new(HashMap::new());
+
+        assert!(!attached(&index, &first));
+        // The keys match, but confirming would read more than hashing, so the file is left to it
+        assert!(!attached(&index, &second));
+        let members: Vec<_> = index.into_inner().unwrap().into_values().collect();
+        assert_eq!(members, vec![(first, vec![])]);
     }
 
     #[test]
@@ -1042,11 +1478,14 @@ mod tests {
         );
     }
 
-    /// Report the duplicates of one group of files sharing a size and hash, decoding the pairs written
-    fn reported_pairs(group: Vec<PathBuf>, counters: &ProgressCounters) -> Vec<(PathBuf, PathBuf)> {
+    /// Report the given hashed group and unhashed pair groups, decoding the pairs written
+    fn decoded_report(
+        files: &HashMap<(u64, u64), Vec<PathBuf>>,
+        pair_groups: &[Vec<PathBuf>],
+        counters: &ProgressCounters,
+    ) -> Vec<(PathBuf, PathBuf)> {
         let mut out = Vec::new();
-        // The size and hash are what grouped the files, which the reporting never reads back
-        report_duplicates(&HashMap::from([((0, 0), group)]), counters, &mut out).unwrap();
+        report_duplicates(files, pair_groups, counters, &mut out).unwrap();
 
         out.split(|&byte| byte == 0)
             .filter(|path| !path.is_empty())
@@ -1055,6 +1494,20 @@ mod tests {
             .chunks(2)
             .map(|pair| (pair[0].clone(), pair[1].clone()))
             .collect()
+    }
+
+    /// Report the duplicates of one group of files sharing a size and hash, decoding the pairs written
+    fn reported_pairs(group: Vec<PathBuf>, counters: &ProgressCounters) -> Vec<(PathBuf, PathBuf)> {
+        // The size and hash are what grouped the files, which the reporting never reads back
+        decoded_report(&HashMap::from([((0, 0), group)]), &[], counters)
+    }
+
+    /// Report the duplicates of one unhashed pair, held to a direct comparison by its size alone
+    fn reported_pair_group(
+        pair: [PathBuf; 2],
+        counters: &ProgressCounters,
+    ) -> Vec<(PathBuf, PathBuf)> {
+        decoded_report(&HashMap::new(), &[pair.into()], counters)
     }
 
     #[test]
@@ -1145,29 +1598,54 @@ mod tests {
     }
 
     #[test]
-    fn report_duplicates_confirms_each_member_of_a_compressed_copy() {
+    fn report_duplicates_confirms_a_member_past_a_differing_variant() {
         let Some(dir) = btrfs_test_dir() else { return };
         let (same, different) = clone_compressed_ranges(dir.path());
         let same_shared = dir.path().join("same-shared");
         fs::copy(&same, &same_shared).unwrap();
-        assert!(files_share_extents(&same, &same_shared));
+        assert!(files_have_same_extent_key(&same, &same_shared));
         // An independent file leads the class, so the compressed copy is the one whose members get confirmed
         let independent = dir.path().join("independent");
         fs::write(&independent, fs::read(&same).unwrap()).unwrap();
         File::open(&independent).unwrap().sync_data().unwrap();
 
-        // The differing range comes first among the shared files, so confirming has to look past it
+        // The differing variant is registered first under the shared key, so confirming a member has to scan past it
         assert_eq!(
             reported_pairs(
                 vec![
                     independent.clone(),
-                    same.clone(),
                     different,
+                    same.clone(),
                     same_shared.clone()
                 ],
                 &ProgressCounters::default()
             ),
             vec![(independent.clone(), same), (independent, same_shared)]
+        );
+    }
+
+    #[test]
+    fn report_duplicates_reports_a_collision_duplicate_hidden_by_shared_extents() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        // The clones share a compressed extent yet hold different bytes; only a hash collision could group them,
+        // which the fake hash key of reported_pairs stands in for
+        let (colliding, hidden) = clone_compressed_ranges(dir.path());
+        // An independent copy of the second clone, the duplicate the shared extent must not hide behind the first
+        let duplicate = dir.path().join("duplicate");
+        fs::write(&duplicate, fs::read(&hidden).unwrap()).unwrap();
+        File::open(&duplicate).unwrap().sync_data().unwrap();
+        let counters = ProgressCounters::default();
+
+        assert_eq!(
+            reported_pairs(
+                vec![colliding, hidden.clone(), duplicate.clone()],
+                &counters
+            ),
+            vec![(hidden, duplicate)]
+        );
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 1 hash collisions, 0 already reflinked, 0 inlined, 1 duplicates"
         );
     }
 
@@ -1195,6 +1673,73 @@ mod tests {
     }
 
     #[test]
+    fn report_duplicates_pair_group_reports_unhashed_duplicates() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::write(&second, fs::read(&first).unwrap()).unwrap();
+        File::open(&second).unwrap().sync_data().unwrap();
+        let counters = ProgressCounters::default();
+
+        assert_eq!(
+            reported_pair_group([first.clone(), second.clone()], &counters),
+            vec![(first, second)]
+        );
+    }
+
+    #[test]
+    fn report_duplicates_pair_group_of_distinct_contents_reports_nothing() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        let mut other = incompressible_bytes(EXTENT_SIZE);
+        *other.first_mut().unwrap() ^= 0xff;
+        fs::write(&second, other).unwrap();
+        File::open(&second).unwrap().sync_data().unwrap();
+        let counters = ProgressCounters::default();
+
+        assert_eq!(
+            reported_pair_group([first.clone(), second.clone()], &counters),
+            vec![]
+        );
+        // Two contents behind one size is the normal outcome of an unhashed pair, not a hash collision
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 0 hash collisions, 0 already reflinked, 0 inlined, 0 duplicates"
+        );
+    }
+
+    #[test]
+    fn report_duplicates_pair_group_of_compressed_clones_reports_nothing() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = clone_compressed_ranges(dir.path());
+        let counters = ProgressCounters::default();
+
+        assert_eq!(reported_pair_group([first, second], &counters), vec![]);
+        // The shared extent does not prove the pair equal, so it counts neither as reflinked nor as duplicate
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 0 hash collisions, 0 already reflinked, 0 inlined, 0 duplicates"
+        );
+    }
+
+    #[test]
+    fn report_duplicates_pair_group_counts_reflinked_compressed_pair() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_compressed(&first, EXTENT_SIZE);
+        fs::copy(&first, &second).unwrap();
+        assert!(files_have_same_extent_key(&first, &second));
+        let counters = ProgressCounters::default();
+
+        assert_eq!(reported_pair_group([first, second], &counters), vec![]);
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 0 hash collisions, 1 already reflinked, 0 inlined, 0 duplicates"
+        );
+    }
+
+    #[test]
     fn progress_counters_display_reports_every_counter() {
         let counters = ProgressCounters::default();
         counters.file.fetch_add(6, Ordering::Relaxed);
@@ -1210,51 +1755,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn size_tracker_withholds_a_size_seen_once() {
-        let mut size_tracker = SizeTracker::default();
+    /// Collect the pairs a tracker still withholds, sorted for stable comparison
+    fn tracked_pairs(size_tracker: SizeTracker) -> Vec<Vec<PathBuf>> {
+        let mut pairs: Vec<_> = size_tracker.into_pairs().collect();
+        pairs.sort();
+        pairs
+    }
 
-        assert_eq!(size_tracker.track(PathBuf::from("a"), 1), [None, None]);
-        assert_eq!(size_tracker.track(PathBuf::from("b"), 2), [None, None]);
+    /// Take in a file named `path` of the given size, as the size iteration does
+    fn track(size_tracker: &mut SizeTracker, path: &str, file_size: u64) -> [Option<PathBuf>; 3] {
+        size_tracker.track(path.into(), file_size)
     }
 
     #[test]
-    fn size_tracker_releases_both_files_completing_a_pair() {
+    fn size_tracker_withholds_a_pair_for_direct_comparison() {
         let mut size_tracker = SizeTracker::default();
-        size_tracker.track(PathBuf::from("a"), 1);
 
+        assert_eq!(track(&mut size_tracker, "a", 1), [None, None, None]);
+        assert_eq!(track(&mut size_tracker, "b", 1), [None, None, None]);
         assert_eq!(
-            size_tracker.track(PathBuf::from("b"), 1),
-            [Some(PathBuf::from("a")), Some(PathBuf::from("b"))]
+            tracked_pairs(size_tracker),
+            vec![vec![PathBuf::from("a"), PathBuf::from("b")]]
         );
     }
 
     #[test]
-    fn size_tracker_releases_only_the_new_file_of_an_already_shared_size() {
+    fn size_tracker_transitions_from_pair_to_hashing() {
         let mut size_tracker = SizeTracker::default();
-        size_tracker.track(PathBuf::from("a"), 1);
-        size_tracker.track(PathBuf::from("b"), 1);
+        assert_eq!(track(&mut size_tracker, "a", 1), [None, None, None]);
+        assert_eq!(track(&mut size_tracker, "b", 1), [None, None, None]);
 
+        // The third file of a size ends the direct comparison plan, releasing the two withheld files with it
         assert_eq!(
-            size_tracker.track(PathBuf::from("c"), 1),
-            [None, Some(PathBuf::from("c"))]
+            track(&mut size_tracker, "c", 1),
+            [Some("a".into()), Some("b".into()), Some("c".into())]
         );
+        // Once hashing, each further file of the size is released on its own
+        assert_eq!(
+            track(&mut size_tracker, "d", 1),
+            [None, None, Some("d".into())]
+        );
+        assert_eq!(tracked_pairs(size_tracker), Vec::<Vec<PathBuf>>::new());
     }
 
     #[test]
     fn size_tracker_keeps_sizes_independent() {
         let mut size_tracker = SizeTracker::default();
-        size_tracker.track(PathBuf::from("a"), 1);
-        size_tracker.track(PathBuf::from("b"), 2);
+        track(&mut size_tracker, "a", 1);
+        track(&mut size_tracker, "b", 2);
+        track(&mut size_tracker, "c", 2);
 
+        // The lone file of size 1 stays withheld while size 2 crosses into hashing
         assert_eq!(
-            size_tracker.track(PathBuf::from("c"), 2),
-            [Some(PathBuf::from("b")), Some(PathBuf::from("c"))]
+            track(&mut size_tracker, "d", 2),
+            [Some("b".into()), Some("c".into()), Some("d".into())]
         );
+        assert_eq!(tracked_pairs(size_tracker), Vec::<Vec<PathBuf>>::new());
     }
 
     #[test]
-    fn files_share_extents_not_partially_rewritten_reflink() {
+    fn wanted_file_size_keeps_the_minimum_and_drops_empty_files() {
+        assert_eq!(wanted_file_size(4, Some(4)), Some(4));
+        assert_eq!(wanted_file_size(3, Some(4)), None);
+        assert_eq!(wanted_file_size(4, None), Some(4));
+        // An empty file has no duplicate worth reflinking, whatever the threshold
+        assert_eq!(wanted_file_size(0, None), None);
+    }
+
+    #[test]
+    fn files_have_same_extent_key_not_partially_rewritten_reflink() {
         let Some(dir) = btrfs_test_dir() else { return };
         let (first, second) = pair_paths(dir.path());
         write_flushed(&first, EXTENT_SIZE);
@@ -1266,11 +1835,11 @@ mod tests {
             .unwrap();
         file.sync_data().unwrap();
 
-        assert!(!files_share_extents(&first, &second));
+        assert!(!files_have_same_extent_key(&first, &second));
     }
 
     #[test]
-    fn files_share_extents_not_sparse_and_dense() {
+    fn files_have_same_extent_key_not_sparse_and_dense() {
         let Some(dir) = btrfs_test_dir() else { return };
         let sparse = dir.path().join("sparse");
         let dense = dir.path().join("dense");
@@ -1289,7 +1858,7 @@ mod tests {
         dense_file.write_all(&tail).unwrap();
         dense_file.sync_data().unwrap();
 
-        assert!(!files_share_extents(&sparse, &dense));
+        assert!(!files_have_same_extent_key(&sparse, &dense));
     }
 
     #[test]
@@ -1300,7 +1869,7 @@ mod tests {
 
         // Only a synthesized map can hold the same extent at another offset, which a hole opening ahead of the
         // data would produce while changing the bytes the file reads as
-        let extents = file_extents(&path).unwrap();
+        let extents = path_extents(&path);
         let mut shifted = extents.clone();
         shifted[0].fe_logical += EXTENT_SIZE as u64;
 
@@ -1320,8 +1889,8 @@ mod tests {
         file.set_len(INLINE_SIZE as u64).unwrap();
         file.sync_data().unwrap();
 
-        let inlined_extents = file_extents(&inlined).unwrap();
-        let truncated_extents = file_extents(&truncated).unwrap();
+        let inlined_extents = path_extents(&inlined);
+        let truncated_extents = path_extents(&truncated);
         assert!(is_inlined(&inlined_extents));
         assert!(!is_inlined(&truncated_extents));
 
@@ -1342,8 +1911,8 @@ mod tests {
         file.set_len(EXTENT_SIZE as u64 / 2).unwrap();
         file.sync_data().unwrap();
 
-        let whole_extents = file_extents(&whole).unwrap();
-        let part_extents = file_extents(&part).unwrap();
+        let whole_extents = path_extents(&whole);
+        let part_extents = path_extents(&part);
         assert_eq!(whole_extents.len(), part_extents.len());
         assert_eq!(whole_extents[0].fe_physical, part_extents[0].fe_physical);
         assert_ne!(whole_extents[0].fe_length, part_extents[0].fe_length);
@@ -1361,7 +1930,7 @@ mod tests {
         file.write_all(&incompressible_bytes(EXTENT_SIZE)).unwrap();
         file.sync_data().unwrap();
 
-        let extents = file_extents(&path).unwrap();
+        let extents = path_extents(&path);
         assert!(extents.len() > 1);
 
         // Every extent of the shorter map is shared, yet the files are not
@@ -1382,7 +1951,7 @@ mod tests {
         assert!(extents1
             .iter()
             .chain(extents2.iter())
-            .all(|extent| extent.fe_flags.intersects(UNRESOLVED_EXTENT_FLAGS)));
+            .all(|extent| extent.fe_flags & UNRESOLVED_EXTENT_FLAGS != 0));
 
         // Both map the same way, so a key would group them
         assert!(extent_key(&extents1).is_none());
@@ -1395,11 +1964,11 @@ mod tests {
         let path = dir.path().join("file");
         write_unflushed(&path, EXTENT_SIZE);
 
-        let extents = file_extents(&path).unwrap();
+        let extents = path_extents(&path);
         assert!(!extents.is_empty());
         assert!(!extents
             .iter()
-            .any(|extent| extent.fe_flags.intersects(UNRESOLVED_EXTENT_FLAGS)));
+            .any(|extent| extent.fe_flags & UNRESOLVED_EXTENT_FLAGS != 0));
     }
 
     #[test]
@@ -1408,40 +1977,30 @@ mod tests {
         let path = dir.path().join("file");
         write_unflushed(&path, INLINE_SIZE);
 
-        let extents = file_extents(&path).unwrap();
-        assert!(extents.iter().any(|extent| extent
-            .fe_flags
-            .contains(fiemap::FiemapExtentFlags::DATA_INLINE)));
+        let extents = path_extents(&path);
+        assert!(extents
+            .iter()
+            .any(|extent| extent.fe_flags & ioctl::FIEMAP_EXTENT_DATA_INLINE != 0));
     }
 
     #[test]
-    fn read_nul_path_terminated() {
-        let mut reader = &b"/a/b\0/c/d\0"[..];
-        let mut buf = Vec::new();
-        assert_eq!(
-            read_nul_path(&mut reader, &mut buf).unwrap(),
-            Some(Path::new("/a/b"))
-        );
-        assert_eq!(
-            read_nul_path(&mut reader, &mut buf).unwrap(),
-            Some(Path::new("/c/d"))
-        );
-        assert_eq!(read_nul_path(&mut reader, &mut buf).unwrap(), None);
-    }
+    fn file_extents_reads_past_one_ioctl_batch() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        let mut file = File::create(&path).unwrap();
+        // A byte in every other clone-sized slot leaves a hole between the writes, so they never coalesce into
+        // fewer extents than one batch holds
+        let last_offset = u64::from(FIEMAP_BATCH_SIZE) * 2 * CLONE_RANGE_SIZE;
+        for index in 0..=FIEMAP_BATCH_SIZE {
+            file.seek(io::SeekFrom::Start(u64::from(index) * 2 * CLONE_RANGE_SIZE))
+                .unwrap();
+            file.write_all(b"x").unwrap();
+        }
+        file.sync_data().unwrap();
 
-    #[test]
-    fn read_nul_path_unterminated_last() {
-        let mut reader = &b"/a/b\0/c/d"[..];
-        let mut buf = Vec::new();
-        assert_eq!(
-            read_nul_path(&mut reader, &mut buf).unwrap(),
-            Some(Path::new("/a/b"))
-        );
-        assert_eq!(
-            read_nul_path(&mut reader, &mut buf).unwrap(),
-            Some(Path::new("/c/d"))
-        );
-        assert_eq!(read_nul_path(&mut reader, &mut buf).unwrap(), None);
+        let extents = path_extents(&path);
+        assert!(extents.len() > FIEMAP_BATCH_SIZE as usize);
+        assert!(extents.last().unwrap().fe_logical >= last_offset);
     }
 
     #[test]
@@ -1461,16 +2020,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, b"/a\xff/b\0/c\xfe/d\0");
-    }
-
-    #[test]
-    fn read_nul_path_non_utf8() {
-        let mut reader = &b"/a\xff/b\0"[..];
-        let mut buf = Vec::new();
-        assert_eq!(
-            read_nul_path(&mut reader, &mut buf).unwrap(),
-            Some(Path::new(OsStr::from_bytes(b"/a\xff/b")))
-        );
     }
 
     #[test]
@@ -1499,6 +2048,59 @@ mod tests {
     }
 
     #[test]
+    fn walk_btrfs_dir_follows_a_root_symlink() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let tree = dir.path().join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("file"), b"content").unwrap();
+        let link = dir.path().join("link");
+        symlink(&tree, &link).unwrap();
+
+        let walked: Vec<PathBuf> = walk_btrfs_dir(&link, None)
+            .unwrap()
+            .map(|(path, _size)| path)
+            .collect();
+
+        assert_eq!(walked, vec![link.join("file")]);
+    }
+
+    #[test]
+    fn walk_btrfs_dir_does_not_follow_nested_symlinks() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let tree = dir.path().join("tree");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&tree).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(tree.join("inside"), b"content").unwrap();
+        fs::write(outside.join("escaped"), b"content").unwrap();
+        symlink(&outside, tree.join("link")).unwrap();
+
+        let walked: Vec<PathBuf> = walk_btrfs_dir(&tree, None)
+            .unwrap()
+            .map(|(path, _size)| path)
+            .collect();
+
+        assert_eq!(walked, vec![tree.join("inside")]);
+    }
+
+    #[test]
+    fn walk_btrfs_dir_includes_hidden_files() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let hidden = dir.path().join(".hidden");
+        let regular = dir.path().join("regular");
+        fs::write(&hidden, b"content").unwrap();
+        fs::write(&regular, b"content").unwrap();
+
+        let mut walked: Vec<PathBuf> = walk_btrfs_dir(dir.path(), None)
+            .unwrap()
+            .map(|(path, _size)| path)
+            .collect();
+        walked.sort();
+
+        assert_eq!(walked, vec![hidden, regular]);
+    }
+
+    #[test]
     fn walk_btrfs_dir_descends_into_subvolumes() {
         let Some(dir) = btrfs_test_dir() else { return };
         let subvolume = create_subvolume(dir.path(), "subvolume");
@@ -1507,10 +2109,9 @@ mod tests {
         fs::write(subvolume.join("inside"), b"content").unwrap();
         fs::write(nested.join("deeper"), b"content").unwrap();
 
-        let mut walked: Vec<PathBuf> = walk_btrfs_dir(dir.path())
+        let mut walked: Vec<PathBuf> = walk_btrfs_dir(dir.path(), None)
             .unwrap()
-            .map(|entry| entry.unwrap().into_path())
-            .filter(|path| path.is_file())
+            .map(|(path, _size)| path)
             .collect();
         walked.sort();
 
