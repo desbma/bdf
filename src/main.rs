@@ -104,6 +104,56 @@ struct FiemapRequest {
 /// Convenience type for a pair of crossbeam channel ends
 type CrossbeamChannel<T> = (crossbeam_channel::Sender<T>, crossbeam_channel::Receiver<T>);
 
+/// Maximum number of files grouped into one channel message
+const BATCH_LEN: usize = 16;
+
+/// Combined file size at or above which a batch is sent without waiting for `BATCH_LEN`
+const BATCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Groups items into batches before sending them, amortizing the per item channel cost
+///
+/// A batch is sent once it holds `BATCH_LEN` items or their combined weight reaches `BATCH_MAX_BYTES`, so a run of
+/// large files is not piled into one lopsided message.
+struct BatchSender<T> {
+    /// Channel the batches are sent on
+    sender: crossbeam_channel::Sender<Vec<T>>,
+    /// Items awaiting a full batch
+    batch: Vec<T>,
+    /// Combined weight of the items in `batch`
+    batch_bytes: u64,
+}
+
+impl<T> BatchSender<T> {
+    /// Wrap a channel sender
+    fn new(sender: crossbeam_channel::Sender<Vec<T>>) -> Self {
+        Self {
+            sender,
+            batch: Vec::with_capacity(BATCH_LEN),
+            batch_bytes: 0,
+        }
+    }
+
+    /// Queue an item weighing `weight` bytes, sending the batch once it fills by count or weight
+    fn send(&mut self, item: T, weight: u64) -> Result<(), crossbeam_channel::SendError<Vec<T>>> {
+        self.batch.push(item);
+        self.batch_bytes += weight;
+        if self.batch.len() == BATCH_LEN || self.batch_bytes >= BATCH_MAX_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Send the pending items, if any
+    fn flush(&mut self) -> Result<(), crossbeam_channel::SendError<Vec<T>>> {
+        if !self.batch.is_empty() {
+            self.sender
+                .send(mem::replace(&mut self.batch, Vec::with_capacity(BATCH_LEN)))?;
+            self.batch_bytes = 0;
+        }
+        Ok(())
+    }
+}
+
 /// Identifier of a Btrfs filesystem, the same for all of its subvolumes
 type BtrfsFsid = [u8; 16];
 
@@ -766,9 +816,9 @@ fn main() -> anyhow::Result<()> {
     let cpu_count = thread::available_parallelism()?.get();
 
     // Channels
-    let (to_hashed_tx, to_hashed_rx): CrossbeamChannel<(PathBuf, u64)> =
+    let (to_hashed_tx, to_hashed_rx): CrossbeamChannel<Vec<(PathBuf, u64)>> =
         crossbeam_channel::unbounded();
-    let (hashed_tx, hashed_rx): CrossbeamChannel<(PathBuf, u64, u64)> =
+    let (hashed_tx, hashed_rx): CrossbeamChannel<Vec<(PathBuf, u64, u64)>> =
         crossbeam_channel::unbounded();
 
     // File hash map
@@ -808,29 +858,37 @@ fn main() -> anyhow::Result<()> {
             workers.push(scope.spawn(move || -> anyhow::Result<()> {
                 let mut hasher = xxh3::Xxh3::new();
                 let mut buffer = Vec::with_capacity(READ_BUFFER_SIZE);
-                while let Ok((path, file_size)) = to_hashed_rx.recv() {
-                    let Ok(file) = File::open(&path).inspect_err(|e| {
-                        log::warn!("Error while hashing {path:?}: {e}");
-                    }) else {
-                        continue;
-                    };
+                while let Ok(batch) = to_hashed_rx.recv() {
+                    let mut hashed_batch = Vec::with_capacity(batch.len());
+                    for (path, file_size) in batch {
+                        let Ok(file) = File::open(&path).inspect_err(|e| {
+                            log::warn!("Error while hashing {path:?}: {e}");
+                        }) else {
+                            continue;
+                        };
 
-                    // Files mapping to the extents of an already tracked file hold its bytes, so probing the
-                    // extents first spares reading data that is already shared
-                    if try_attach_shared(shared_index, &file, &path, file_size)? {
-                        continue;
+                        // Files mapping to the extents of an already tracked file hold its bytes, so probing the
+                        // extents first spares reading data that is already shared
+                        if try_attach_shared(shared_index, &file, &path, file_size)? {
+                            continue;
+                        }
+
+                        let Ok(hash) =
+                            hash_file(&file, &mut hasher, &mut buffer).inspect_err(|e| {
+                                log::warn!("Error while hashing {path:?}: {e}");
+                            })
+                        else {
+                            continue;
+                        };
+
+                        log::debug!("{path:?} {hash:016x}");
+                        progress_counters.hash.fetch_add(1, Ordering::Relaxed);
+
+                        hashed_batch.push((path, file_size, hash));
                     }
-
-                    let Ok(hash) = hash_file(&file, &mut hasher, &mut buffer).inspect_err(|e| {
-                        log::warn!("Error while hashing {path:?}: {e}");
-                    }) else {
-                        continue;
-                    };
-
-                    log::debug!("{path:?} {hash:016x}");
-                    progress_counters.hash.fetch_add(1, Ordering::Relaxed);
-
-                    hashed_tx.send((path, file_size, hash))?;
+                    if !hashed_batch.is_empty() {
+                        hashed_tx.send(hashed_batch)?;
+                    }
                 }
 
                 Ok(())
@@ -841,6 +899,7 @@ fn main() -> anyhow::Result<()> {
 
         // Iterate over files
         let mut size_tracker = SizeTracker::default();
+        let mut to_hashed_tx = BatchSender::new(to_hashed_tx);
         if let Some(walk) = dir_walk {
             for (path, file_size) in walk {
                 log::debug!("{path:?}");
@@ -848,7 +907,7 @@ fn main() -> anyhow::Result<()> {
 
                 let tracked = size_tracker.track(path, file_size);
                 for to_hash in tracked.into_iter().flatten() {
-                    to_hashed_tx.send((to_hash, file_size))?;
+                    to_hashed_tx.send((to_hash, file_size), file_size)?;
                 }
             }
         } else {
@@ -898,17 +957,18 @@ fn main() -> anyhow::Result<()> {
 
                 let tracked = size_tracker.track(path.to_path_buf(), file_size);
                 for to_hash in tracked.into_iter().flatten() {
-                    to_hashed_tx.send((to_hash, file_size))?;
+                    to_hashed_tx.send((to_hash, file_size), file_size)?;
                 }
             }
         }
+        to_hashed_tx.flush()?;
         drop(to_hashed_tx);
 
         // Sizes left holding exactly two files go to a direct comparison, which their hashing would only repeat
         let pair_groups: Vec<Vec<PathBuf>> = size_tracker.into_pairs().collect();
 
         // Fill hashmap
-        for (filepath, file_size, hash) in &hashed_rx {
+        for (filepath, file_size, hash) in hashed_rx.into_iter().flatten() {
             files.entry((file_size, hash)).or_default().push(filepath);
         }
 
@@ -1811,6 +1871,49 @@ mod tests {
             [Some("b".into()), Some("c".into()), Some("d".into())]
         );
         assert_eq!(tracked_pairs(size_tracker), Vec::<Vec<PathBuf>>::new());
+    }
+
+    #[test]
+    fn batch_sender_sends_full_batch_and_flushes_remainder() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut sender = BatchSender::new(sender);
+
+        // A batch short of BATCH_LEN stays buffered
+        for item in 0..BATCH_LEN - 1 {
+            sender.send(item, 0).unwrap();
+        }
+        assert!(receiver.is_empty());
+
+        // The item reaching BATCH_LEN releases the whole batch
+        sender.send(BATCH_LEN - 1, 0).unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            (0..BATCH_LEN).collect::<Vec<_>>()
+        );
+
+        // A trailing item waits for flush rather than a full count
+        sender.send(BATCH_LEN, 0).unwrap();
+        assert!(receiver.is_empty());
+        sender.flush().unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), vec![BATCH_LEN]);
+    }
+
+    #[test]
+    fn batch_sender_sends_at_combined_weight_limit() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut sender = BatchSender::new(sender);
+
+        // The batch is held while its combined weight stays below BATCH_MAX_BYTES
+        sender.send("first", BATCH_MAX_BYTES - 1).unwrap();
+        assert!(receiver.is_empty());
+
+        // Reaching BATCH_MAX_BYTES sends both accumulated items at once
+        sender.send("second", 1).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), vec!["first", "second"]);
+
+        // The weight resets with the batch, so a light item stays buffered again
+        sender.send("third", 1).unwrap();
+        assert!(receiver.is_empty());
     }
 
     #[test]
