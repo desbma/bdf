@@ -47,15 +47,15 @@ See `bdf -h` for complete command line reference.
 
 ### Auto deduplication
 
-To automatically deduplicate files in directory `target_dir`, run `bdf` with `xargs`, and deduplicate with `cp`:
+To automatically deduplicate files in directory `target_dir`, run `bdf` with `xargs`, and deduplicate with [`rmlint`](https://github.com/sahib/rmlint):
 
 ```
-bdf target_dir | xargs -0 -r -p -n 2 cp -v --reflink=always
+bdf target_dir | xargs -0 -r -n 2 rmlint --dedupe -v
 ```
 
-You will need to confirm before each deduplication (due to `xargs` `-p` switch). Be careful because if a file is modified during the analysis, it may get deduplicated although the pair of files are not identical anymore.
+`rmlint --dedupe` makes the second file of each pair share the data of the first with the `FIDEDUPERANGE` ioctl, which the kernel only performs if both files still hold identical data, and which leaves the destination metadata untouched. A file modified between the analysis and the deduplication is therefore skipped, and reported by the `-v` switch.
 
-Reflinking a pair whose files sit in subvolumes mounted separately needs Linux 5.18 or later. Earlier kernels restrict `FICLONE` to a single mount point, and `cp` fails with `EXDEV` even though both files belong to the same filesystem.
+Reflinking a pair whose files sit in subvolumes mounted separately needs Linux 5.18 or later. Earlier kernels restrict `FICLONE` and `FIDEDUPERANGE` to a single mount point, and the deduplication fails with `EXDEV` even though both files belong to the same filesystem.
 
 ## License
 
