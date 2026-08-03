@@ -6,11 +6,12 @@ use std::{
     io::{self, Write},
     iter,
     ops::Range,
-    os::unix::ffi::OsStrExt as _,
+    os::unix::{ffi::OsStrExt as _, io::AsRawFd as _},
     path::{Path, PathBuf},
     sync::{atomic::Ordering, Mutex},
 };
 
+use nix::errno::Errno;
 use rayon::iter::{ParallelBridge as _, ParallelIterator as _};
 
 use crate::{
@@ -18,6 +19,20 @@ use crate::{
     extent::{ambiguous_ranges, extent_key, file_extents, is_inlined, ExtentLocation},
     ProgressCounters,
 };
+
+// FICLONE: _IOW(0x94, 9, int)
+nix::ioctl_write_int!(ficlone, 0x94, 9);
+
+/// Attempt to reflink `source` into `dest` using FICLONE
+///
+/// Returns `Ok(())` on success, `Err` if the ioctl fails (e.g. cross-filesystem,
+/// cross-subvolume on kernels < 5.18, or read-only destination).
+fn try_ficlone(source: &File, dest: &File) -> Result<(), Errno> {
+    let src_fd = source.as_raw_fd();
+    let dst_fd = dest.as_raw_fd();
+    // SAFETY: ioctl write
+    unsafe { ficlone(dst_fd, src_fd.try_into().unwrap_or_default()) }.map(|_| ())
+}
 
 /// Representative of each data copy seen so far, the file kept for hashing while later files found mapping to the
 /// same extents hold its bytes and are therefore spared hashing, keyed by file size and extent key
@@ -219,6 +234,7 @@ where
 fn report_group<W>(
     filepaths: &[PathBuf],
     hashed: bool,
+    dedup: bool,
     counters: &ProgressCounters,
     writer: &Mutex<&mut W>,
 ) -> Result<(), io::Error>
@@ -259,6 +275,22 @@ where
             for path in iter::once(other_path).chain(other.shared.iter().copied()) {
                 log::debug!("Files {first_path:?} and {path:?} are duplicates");
                 counters.duplicate_candidate.fetch_add(1, Ordering::Relaxed);
+                if dedup {
+                    if let (Ok(src), Ok(dst)) = (
+                        File::open(first_path),
+                        File::options().write(true).open(path),
+                    ) {
+                        match try_ficlone(&src, &dst) {
+                            Ok(()) => log::info!("Reflinked {first_path:?} -> {path:?}"),
+                            Err(e) => {
+                                let desc = e.desc();
+                                log::warn!("FICLONE({first_path:?} -> {path:?}) failed: {desc}");
+                            }
+                        }
+                    } else {
+                        log::warn!("Could not open files for FICLONE({first_path:?} -> {path:?})");
+                    }
+                }
                 let mut writer = writer
                     .lock()
                     .map_err(|e| io::Error::other(format!("Poisoned lock: {e}")))?;
@@ -302,6 +334,7 @@ pub(crate) fn merge_shared_members(
 pub(crate) fn report_duplicates<W>(
     files: &HashMap<(u64, u64), Vec<PathBuf>>,
     pair_groups: &[Vec<PathBuf>],
+    dedup: bool,
     counters: &ProgressCounters,
     writer: &mut W,
 ) -> anyhow::Result<()>
@@ -315,7 +348,9 @@ where
         .map(|filepaths| (filepaths, true))
         .chain(pair_groups.iter().map(|filepaths| (filepaths, false)))
         .par_bridge()
-        .try_for_each(|(filepaths, hashed)| report_group(filepaths, hashed, counters, &writer))?;
+        .try_for_each(|(filepaths, hashed)| {
+            report_group(filepaths, hashed, dedup, counters, &writer)
+        })?;
     Ok(())
 }
 
@@ -389,7 +424,7 @@ mod tests {
         counters: &ProgressCounters,
     ) -> Vec<(PathBuf, PathBuf)> {
         let mut out = Vec::new();
-        report_duplicates(files, pair_groups, counters, &mut out).unwrap();
+        report_duplicates(files, pair_groups, false, counters, &mut out).unwrap();
 
         out.split(|&byte| byte == 0)
             .filter(|path| !path.is_empty())
@@ -871,5 +906,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, b"/a\xff/b\0/c\xfe/d\0");
+    }
+
+    #[test]
+    fn try_ficlone_reflinks_a_pair() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::write(&second, fs::read(&first).unwrap()).unwrap();
+        File::open(&second).unwrap().sync_data().unwrap();
+
+        let src = File::open(&first).unwrap();
+        let dst = File::options().write(true).open(&second).unwrap();
+        assert!(try_ficlone(&src, &dst).is_ok());
+        assert!(files_have_same_extent_key(&first, &second));
+    }
+
+    #[test]
+    fn report_duplicates_with_dedup_ficlone_reflinks_pairs() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let (first, second) = pair_paths(dir.path());
+        write_flushed(&first, EXTENT_SIZE);
+        fs::write(&second, fs::read(&first).unwrap()).unwrap();
+        File::open(&second).unwrap().sync_data().unwrap();
+        let counters = ProgressCounters::default();
+
+        // Before dedup, files are independent
+        assert!(!files_have_same_extent_key(&first, &second));
+
+        let mut out = Vec::new();
+        report_duplicates(
+            &HashMap::from([((0, 0), vec![first.clone(), second.clone()])]),
+            &[],
+            true,
+            &counters,
+            &mut out,
+        )
+        .unwrap();
+
+        // After dedup, files should share extents
+        assert!(files_have_same_extent_key(&first, &second));
+        assert_eq!(
+            counters.to_string(),
+            "0 files, 0 hashes, 0 hash collisions, 0 already reflinked, 0 inlined, 1 duplicates"
+        );
     }
 }

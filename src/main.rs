@@ -101,6 +101,10 @@ pub struct CommandLineOpts {
     /// Minimum file size in bytes to consider
     #[structopt(short, long)]
     pub min_size: Option<u64>,
+
+    /// Attempt to reflink each duplicate pair using FICLONE, logging the result.
+    #[structopt(long)]
+    pub dedup: bool,
 }
 
 /// Processing progress counters
@@ -372,7 +376,13 @@ fn main() -> anyhow::Result<()> {
 
     // Find candidates
     let mut stdout = io::stdout();
-    report_duplicates(&files, &pair_groups, &progress_counters, &mut stdout)?;
+    report_duplicates(
+        &files,
+        &pair_groups,
+        cl_opts.dedup,
+        &progress_counters,
+        &mut stdout,
+    )?;
 
     progress.finish();
 
