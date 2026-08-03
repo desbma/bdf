@@ -14,15 +14,13 @@ Compared to alternative solutions, `bdf` is fast and simple. It does not store a
 
 ## Algorithm summary
 
-1. Walk the input tree with parallel threads, and get the size of every file \*
-2. For sizes shared by three files or more, compute the [XXH3-64](https://github.com/Cyan4973/xxHash) of each file \*\*
+1. Walk the input tree with parallel threads, and get the size of every file
+2. For sizes shared by three files or more, compute the [XXH3-64](https://github.com/Cyan4973/xxHash) of each file
 3. For files with the same hash and size, or pairs of files alone sharing a size, ask Btrfs where each file stores its data (using [fiemap](https://www.kernel.org/doc/html/latest/filesystems/fiemap.html)), and group the files that already share it
 4. Compare one file per copy of the data to confirm the content is identical, which for hashed groups also catches the extremely unlikely but possible case of a hash collision
 5. Files holding the same content, but each in its own copy of the data, are considered duplicates candidate for reflinking
 
-_\* Files whose size no other file shares can not be duplicates, and are dismissed without reading their data (the common case), which leads to a major overall speedup. A size shared by exactly two files skips hashing entirely: directly comparing the pair reads less than hashing both files._
-
-_\*\* Hashes are computed in separate threads to make use of multi core CPUs. Before a file is read, its extents are mapped: a file mapping to the same extents as a file already picked for hashing holds the same bytes, and is attached to it without hashing it (compressed extents whose location does not pin the bytes down are first compared directly). Steps 3 and 4 also run on parallel worker threads, spare reading files whose extents show they already share their data, and read only one file per data copy for the comparison._
+_Files whose size no other file shares can not be duplicates, and are dismissed without reading their data, which is the common case and leads to a major speedup. Every step runs on parallel worker threads._
 
 ## Installation
 
