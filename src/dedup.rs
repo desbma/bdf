@@ -218,6 +218,28 @@ fn content_classes<'c, 'p>(
     Ok(classes)
 }
 
+/// Deduplicate a pair of files
+fn dedup_pair(src_path: &Path, dst_path: &Path) {
+    if let (Ok(src), Ok(dst)) = (
+        File::open(src_path),
+        File::options().write(true).open(dst_path),
+    ) {
+        let mod_time = dst.metadata().and_then(|md| md.modified()).ok();
+        match try_ficlone(&src, &dst) {
+            Ok(()) => log::info!("Reflinked {src_path:?} -> {dst_path:?}"),
+            Err(e) => {
+                let desc = e.desc();
+                log::warn!("FICLONE({src_path:?} -> {dst_path:?}) failed: {desc}");
+            }
+        }
+        if let Some(mt) = mod_time {
+            let _ = dst.set_modified(mt);
+        }
+    } else {
+        log::warn!("Could not open files for FICLONE({src_path:?} -> {dst_path:?})");
+    }
+}
+
 /// Write a NUL terminated duplicate pair
 fn write_pair<W>(writer: &mut W, first: &Path, second: &Path) -> Result<(), io::Error>
 where
@@ -276,20 +298,7 @@ where
                 log::debug!("Files {first_path:?} and {path:?} are duplicates");
                 counters.duplicate_candidate.fetch_add(1, Ordering::Relaxed);
                 if dedup {
-                    if let (Ok(src), Ok(dst)) = (
-                        File::open(first_path),
-                        File::options().write(true).open(path),
-                    ) {
-                        match try_ficlone(&src, &dst) {
-                            Ok(()) => log::info!("Reflinked {first_path:?} -> {path:?}"),
-                            Err(e) => {
-                                let desc = e.desc();
-                                log::warn!("FICLONE({first_path:?} -> {path:?}) failed: {desc}");
-                            }
-                        }
-                    } else {
-                        log::warn!("Could not open files for FICLONE({first_path:?} -> {path:?})");
-                    }
+                    dedup_pair(first_path, path);
                 }
                 let mut writer = writer
                     .lock()
