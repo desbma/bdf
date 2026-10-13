@@ -64,11 +64,11 @@ struct FiemapHeader {
 
 /// A whole FIEMAP request, the header followed by the extent buffer it announces
 #[repr(C)]
-struct FiemapRequest {
+struct FiemapRequest<const N: usize> {
     /// Request header
     header: FiemapHeader,
     /// Extent buffer the kernel fills
-    extents: [FiemapExtent; FIEMAP_BATCH_SIZE as usize],
+    extents: [FiemapExtent; N],
 }
 
 /// Offset of one extent in the file, its location on the device, and its length
@@ -88,37 +88,73 @@ nix::ioctl_readwrite!(
 /// will be inlined.
 pub(crate) fn file_extents(file: &File, sync: bool) -> Result<Vec<FiemapExtent>, io::Error> {
     let mut extents: Vec<FiemapExtent> = Vec::new();
-    // SAFETY: every field is an integer, for which zero is a valid value
-    let mut request: FiemapRequest = unsafe { zeroed() };
     loop {
-        request.header = FiemapHeader {
-            fm_start: extents
-                .last()
-                .map_or(0, |last| last.fe_logical + last.fe_length),
-            fm_length: u64::MAX,
-            // One flush resolves delayed allocation for the whole file, so further batches skip it
-            fm_flags: if sync && extents.is_empty() {
-                ioctl::FIEMAP_FLAG_SYNC
-            } else {
-                0
-            },
-            fm_mapped_extents: 0,
-            fm_extent_count: FIEMAP_BATCH_SIZE,
-            fm_reserved: 0,
+        let start = extents
+            .last()
+            .map_or(0, |last| last.fe_logical + last.fe_length);
+        // One flush resolves delayed allocation for the whole file, so further batches skip it
+        let flags = if sync && extents.is_empty() {
+            ioctl::FIEMAP_FLAG_SYNC
+        } else {
+            0
         };
-        // SAFETY: the ioctl writes at most `fm_extent_count` extents into the buffer following the header, which
-        // `FiemapRequest` lays out with that capacity
-        unsafe { fs_fiemap(file.as_raw_fd(), &raw mut request.header) }?;
-        let mapped = request.header.fm_mapped_extents as usize;
-        extents.extend(request.extents.iter().take(mapped).copied());
+        let batch = map_extents::<{ FIEMAP_BATCH_SIZE as usize }>(file, start, u64::MAX, flags)?;
+        let mapped = batch.len();
+        extents.extend(batch);
         if mapped < FIEMAP_BATCH_SIZE as usize
             || extents
                 .last()
                 .is_some_and(|last| last.fe_flags & ioctl::FIEMAP_EXTENT_LAST != 0)
         {
-            return Ok(extents);
+            return split_merged(file, extents);
         }
     }
+}
+
+/// Map up to `N` extents intersecting the logical range of `length` bytes beginning at `start`
+fn map_extents<const N: usize>(
+    file: &File,
+    start: u64,
+    length: u64,
+    flags: u32,
+) -> Result<impl ExactSizeIterator<Item = FiemapExtent>, io::Error> {
+    // SAFETY: every field is an integer, for which zero is a valid value
+    let mut request: FiemapRequest<N> = unsafe { zeroed() };
+    request.header.fm_start = start;
+    request.header.fm_length = length;
+    request.header.fm_flags = flags;
+    request.header.fm_extent_count = u32::try_from(N).map_err(io::Error::other)?;
+    // SAFETY: the ioctl writes at most `fm_extent_count` extents into the buffer following the header, which
+    // `FiemapRequest` lays out with that capacity
+    unsafe { fs_fiemap(file.as_raw_fd(), &raw mut request.header) }?;
+    let mapped = request.header.fm_mapped_extents as usize;
+    Ok(request.extents.into_iter().take(mapped))
+}
+
+/// Re-map compressed entries at least `BTRFS_MAX_UNCOMPRESSED` bytes long into their underlying extents
+fn split_merged(file: &File, extents: Vec<FiemapExtent>) -> Result<Vec<FiemapExtent>, io::Error> {
+    let mut split = Vec::with_capacity(extents.len());
+    for extent in extents {
+        // A shorter entry is ambiguous already, whatever extents it covers
+        if extent.fe_flags & ioctl::FIEMAP_EXTENT_ENCODED == 0
+            || extent.fe_length < BTRFS_MAX_UNCOMPRESSED
+        {
+            split.push(extent);
+            continue;
+        }
+        let end = extent.fe_logical + extent.fe_length;
+        let mut start = extent.fe_logical;
+        while start < end {
+            // Mapping a single byte ends the request at the extent holding it, before a neighbour can merge in
+            let piece = map_extents::<1>(file, start, 1, 0)?
+                .next()
+                .filter(|piece| piece.fe_logical == start && piece.fe_length > 0)
+                .ok_or_else(|| io::Error::other("Extent map changed while mapping it"))?;
+            start += piece.fe_length;
+            split.push(piece);
+        }
+    }
+    Ok(split)
 }
 
 /// Whether a file stores its data in filesystem metadata rather than in a data extent
@@ -147,8 +183,7 @@ pub(crate) fn extent_key(extents: &[FiemapExtent]) -> Option<Vec<ExtentLocation>
 
 /// Identify the ranges of the file whose extents leave the bytes unproven between files sharing them
 ///
-/// The mapping omits the offset of the data inside a compressed extent, so an extent shorter than the largest
-/// Btrfs writes may cover any range of a larger extent, and files mapping to it can hold different bytes.
+/// The map must come from `file_extents`, with merged compressed entries split.
 pub(crate) fn ambiguous_ranges(extents: &[FiemapExtent]) -> Vec<Range<u64>> {
     extents
         .iter()
@@ -169,9 +204,9 @@ mod tests {
 
     use super::*;
     use crate::tests::{
-        btrfs_test_dir, files_have_same_extent_key, incompressible_bytes, pair_paths, path_extents,
-        write_compressed, write_flushed, write_unflushed, CLONE_RANGE_SIZE, EXTENT_SIZE,
-        INLINE_SIZE,
+        btrfs_test_dir, clone_range, files_have_same_extent_key, incompressible_bytes, pair_paths,
+        path_extents, write_compressed, write_flushed, write_unflushed, CLONE_RANGE_SIZE,
+        EXTENT_SIZE, INLINE_SIZE,
     };
 
     #[test]
@@ -236,6 +271,55 @@ mod tests {
         dense_file.sync_data().unwrap();
 
         assert!(!files_have_same_extent_key(&sparse, &dense));
+    }
+
+    #[test]
+    fn files_have_same_extent_key_not_slices_of_consecutive_compressed_extents() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let base = dir.path().join("base");
+        // The slices only line up from two extents less than a whole extent apart on disk, which neighbours in a
+        // large write usually are
+        let (low, high) = (0..10)
+            .find_map(|_| {
+                write_compressed(&base, 16 * usize::try_from(BTRFS_MAX_UNCOMPRESSED).unwrap());
+                let mut extents = path_extents(&base);
+                extents.sort_unstable_by_key(|extent| extent.fe_physical);
+                extents
+                    .windows(2)
+                    .find(|pair| pair[1].fe_physical - pair[0].fe_physical < BTRFS_MAX_UNCOMPRESSED)
+                    .map(|pair| (pair[0], pair[1]))
+            })
+            .unwrap();
+        let gap = high.fe_physical - low.fe_physical;
+        let (slices, whole) = pair_paths(dir.path());
+        // Combine slices at the same relative offsets their source extents have on disk
+        clone_range(&base, low.fe_logical, gap, &slices, 0);
+        let tail_length = BTRFS_MAX_UNCOMPRESSED - gap;
+        clone_range(&base, high.fe_logical, tail_length, &slices, gap);
+        clone_range(&base, low.fe_logical, BTRFS_MAX_UNCOMPRESSED, &whole, 0);
+        assert_ne!(fs::read(&slices).unwrap(), fs::read(&whole).unwrap());
+
+        assert!(!files_have_same_extent_key(&slices, &whole));
+        assert_eq!(
+            extent_key(&path_extents(&slices)),
+            Some(vec![
+                (0, low.fe_physical, gap),
+                (gap, high.fe_physical, tail_length)
+            ])
+        );
+    }
+
+    #[test]
+    fn split_merged_rejects_disappeared_extent() {
+        let Some(dir) = btrfs_test_dir() else { return };
+        let path = dir.path().join("file");
+        write_compressed(&path, usize::try_from(BTRFS_MAX_UNCOMPRESSED).unwrap());
+        let file = File::options().read(true).write(true).open(&path).unwrap();
+        let extents = map_extents::<1>(&file, 0, u64::MAX, 0).unwrap().collect();
+        file.set_len(0).unwrap();
+
+        let error = split_merged(&file, extents).err().unwrap();
+        assert_eq!(error.to_string(), "Extent map changed while mapping it");
     }
 
     #[test]
