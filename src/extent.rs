@@ -27,6 +27,7 @@ pub(crate) const BTRFS_MAX_UNCOMPRESSED: u64 = 128 * 1024;
 #[expect(clippy::struct_field_names)]
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct FiemapExtent {
     /// Offset of the extent in the file
     fe_logical: u64,
@@ -164,7 +165,6 @@ mod tests {
     use std::{
         fs,
         io::{Seek as _, Write as _},
-        path::Path,
     };
 
     use super::*;
@@ -316,23 +316,28 @@ mod tests {
 
     #[test]
     fn extent_key_none_for_unresolved_locations() {
-        let Some(dir) = btrfs_test_dir() else { return };
-        let (first, second) = pair_paths(dir.path());
-        write_unflushed(&first, EXTENT_SIZE);
-        write_unflushed(&second, EXTENT_SIZE);
-
         // Covers a write landing between the flush and the mapping, which the flush in file_extents makes
         // otherwise unreachable
-        let extents1 = unflushed_extents(&first);
-        let extents2 = unflushed_extents(&second);
-        assert!(extents1
-            .iter()
-            .chain(extents2.iter())
-            .all(|extent| extent.fe_flags & UNRESOLVED_EXTENT_FLAGS != 0));
+        let extents = [FiemapExtent {
+            fe_length: EXTENT_SIZE as u64,
+            fe_flags: ioctl::FIEMAP_EXTENT_DELALLOC | ioctl::FIEMAP_EXTENT_UNKNOWN,
+            ..FiemapExtent::default()
+        }];
 
-        // Both map the same way, so a key would group them
-        assert!(extent_key(&extents1).is_none());
-        assert!(extent_key(&extents2).is_none());
+        // Unresolved locations match between unrelated files, so a key would group them
+        assert!(extent_key(&extents).is_none());
+
+        // A resolved prefix does not make up for a pending tail
+        let resolved = FiemapExtent {
+            fe_physical: 4096,
+            fe_length: EXTENT_SIZE as u64,
+            ..FiemapExtent::default()
+        };
+        let pending = FiemapExtent {
+            fe_logical: resolved.fe_length,
+            ..extents[0]
+        };
+        assert!(extent_key(&[resolved, pending]).is_none());
     }
 
     #[test]
@@ -378,10 +383,5 @@ mod tests {
         let extents = path_extents(&path);
         assert!(extents.len() > FIEMAP_BATCH_SIZE as usize);
         assert!(extents.last().unwrap().fe_logical >= last_offset);
-    }
-
-    /// Map a file without flushing it, leaving delayed allocation unresolved
-    fn unflushed_extents(path: &Path) -> Vec<FiemapExtent> {
-        file_extents(&File::open(path).unwrap(), false).unwrap()
     }
 }
