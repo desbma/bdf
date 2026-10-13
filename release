@@ -21,6 +21,5 @@ cargo update
 cargo check
 cargo test
 
-git tag -f -m "Version ${VERSION}" "${VERSION}"
-
 jj new
+jj tag set -r @- "${VERSION}"
